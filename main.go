@@ -275,6 +275,13 @@ func main() {
 	os.Unsetenv("WEBDAV_PASSWORD")
 	os.Unsetenv("WEBDAV_COOKIE")
 
+	if mountOpts.TLSSkipVerify && (username != "" || password != "" || cookie != "") {
+		fmt.Fprintf(os.Stderr,
+			"%s: warning: tlsskipverify is set together with credentials - "+
+				"TLS certificate verification is disabled, so these credentials "+
+				"are not protected against a network man-in-the-middle\n", progname)
+	}
+
 	// for some reason we can end up without a $PATH ..
 	if os.Getenv("PATH") == "" {
 		os.Setenv("PATH", DefaultPath)
