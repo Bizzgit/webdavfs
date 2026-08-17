@@ -112,7 +112,12 @@ func parseMountOptions(mo *MountOptions, n string, sloppy bool) (err error) {
 		}
 		err = applyOption(mo, a[0], v)
 		if err != nil {
-			if sloppy {
+			// -s/sloppy is meant to tolerate unknown option *names*,
+			// not to hide a broken configfile=: swallowing that would
+			// let the mount proceed with empty/missing credentials
+			// instead of failing loudly (fail-open to anonymous auth).
+			var cfErr *ConfigFileError
+			if sloppy && !errors.As(err, &cfErr) {
 				err = nil
 				continue
 			}

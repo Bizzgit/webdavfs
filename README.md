@@ -106,7 +106,7 @@ Using it is simple as:
 | -T opts | trace options: fuse,webdav,httpreq,httphdr |
 | -F file | trace file. file will be reopened when renamed, tracing will stop when file is removed |
 | -o opts | mount options |
-| -C file | config file: same option syntax as -o, one option per line, `#` for comments. Options given via -o override the same option from the config file. Mainly meant for credentials, so they don't need to be on the command line or in fstab. |
+| -C file | config file: same option syntax as -o, one option per line, `#` for comments. Options given via -o override the same option from the config file. Mainly meant for credentials, so they don't need to be on the command line or in fstab. Not reachable from /etc/fstab or systemd .mount units - use the `configfile=` mount option below for that. The file's permissions must not be group/world readable (webdavfs refuses to load it otherwise), same posture as an SSH private key. |
 
 ## Mount options
 
@@ -136,12 +136,19 @@ Using it is simple as:
 |                        | the remote server doesn't advertise support (DANGEROUS)
 | tlsskipverify          | Don't verify the remote server's TLS certificate. Needed
 |                        | for https:// URLs with a self-signed certificate (DANGEROUS:
-|                        | disables protection against man-in-the-middle attacks)
+|                        | disables protection against man-in-the-middle attacks - note this
+|                        | also means any credentials sent over that connection, including
+|                        | ones loaded via `configfile=`/-C, are exposed to that same MITM;
+|                        | using both together protects credentials from local exposure only,
+|                        | not from the network)
 | configfile=file        | Load more options (same syntax as -C, see above) from file, applied
 |                        | in place at this point in the option list. Unlike -C, this **is**
 |                        | reachable from /etc/fstab and systemd .mount units, since those only
 |                        | ever pass through the mount options, not extra command-line flags -
 |                        | this is the one to use to keep credentials out of fstab/the unit file.
+|                        | Same permission restriction as -C applies. A file referencing itself
+|                        | (directly or via a chain of configfile= options) fails with a clear
+|                        | error rather than recursing.
 
 If the webdavfs program is called via `mount -t webdavfs` or as `mount.webdav`,
 it will fork, re-exec and run in the background. In that case it will remove
@@ -151,15 +158,14 @@ via the environment instead.
 The environment options for username and password are WEBDAV_USERNAME and
 WEBDAV_PASSWORD, respectively.
 
-In the future it will also be possible to read the credentials from a
-configuration file.
+Credentials can also be loaded from a config file - see `-C` and
+`configfile=` above. Note that `-T httphdr` tracing prints full request
+headers, including `Authorization` and `Cookie`, to the trace file - if
+you're keeping credentials out of `ps`/fstab via a config file, the
+trace file is an equally sensitive place for them to leak from.
 
 ## TODO
 
-- maxconns doesn't work yet. this is complicated with the Go HTTP client.
-- add configuration file
-- timeout handling and interrupt handling
-- we use busy-loop locking, yuck. use semaphores built on channels.
 - rewrite fuse.go code to use the bazil/fuse abstraction instead of bazil/fuse/fs.  
   perhaps switch to  
   - https://github.com/hanwen/go-fuse

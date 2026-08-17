@@ -11,6 +11,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -236,10 +237,24 @@ func (d *DavError) Error() string {
 	return d.Message
 }
 
-func (d *DavClient) semAcquire() {
+// semAcquire blocks until a connection slot is free, or ctx is done -
+// without this, a cancelled FUSE request would still hang here until a
+// slot frees up even though the whole point of threading ctx through is
+// that a cancelled request stops waiting immediately.
+func (d *DavClient) semAcquire(ctx context.Context) error {
 	if d.MaxConns > 0 {
-		d.davSem <- davEmpty{}
+		select {
+		case d.davSem <- davEmpty{}:
+		case <-ctx.Done():
+			// Return a fuse.Errno (EINTR), not the raw ctx.Err() -
+			// bazil.org/fuse only maps errors implementing its
+			// ErrorNumber interface to a real errno; anything else
+			// falls back to a generic EIO, which would make this
+			// indistinguishable from an actual I/O failure.
+			return EINTR
+		}
 	}
+	return nil
 }
 
 func (d *DavClient) semRelease() {
@@ -320,7 +335,27 @@ func (d *DavClient) do(req *http.Request) (resp *http.Response, err error) {
 	}
 
 	resp, err = d.cc.Do(req)
-	if err == nil && !statusIsValid(resp) {
+	if err != nil {
+		// Always report this (not gated by -T) for methods that can
+		// have side effects: if the request body had already been
+		// sent when the context was cancelled, the server may have
+		// applied the write before the client tore the connection
+		// down, so "cancelled" here does not necessarily mean
+		// "nothing changed on the remote". Silently treating it as a
+		// plain failure would hide a torn write. Read-only methods
+		// (GET/PROPFIND/OPTIONS) have no such risk and are far more
+		// commonly cancelled in normal use (e.g. an interrupted `ls`
+		// or `find`), so they're left to the existing -T-gated
+		// tracing instead of adding noise here.
+		if ctxErr := req.Context().Err(); ctxErr != nil {
+			switch req.Method {
+			case "PUT", "PATCH", "DELETE", "MKCOL", "MOVE":
+				fmt.Fprintf(os.Stderr,
+					"webdavfs: %s %s: request %v (remote may already have applied it if the body was sent)\n",
+					req.Method, req.URL.Path, ctxErr)
+			}
+		}
+	} else if !statusIsValid(resp) {
 		err = davToErrno(&DavError{
 			Message: resp.Status,
 			Code: resp.StatusCode,
@@ -414,7 +449,9 @@ func (d *DavClient) Mount() (err error) {
 
 func (d *DavClient) PropFind(ctx context.Context, path string, depth int, props []string) (ret []*Props, err error) {
 
-	d.semAcquire()
+	if err = d.semAcquire(ctx); err != nil {
+		return
+	}
 	defer d.semRelease()
 
 	if trace(T_WEBDAV) {
@@ -645,7 +682,9 @@ func (d *DavClient) Get(ctx context.Context, path string) (data []byte, err erro
 }
 
 func (d *DavClient) GetRange(ctx context.Context, path string, offset int64, length int) (data []byte, err error) {
-	d.semAcquire()
+	if err = d.semAcquire(ctx); err != nil {
+		return
+	}
 	defer d.semRelease()
 
 	if trace(T_WEBDAV) && length >= 0 {
@@ -692,7 +731,9 @@ func (d *DavClient) GetRange(ctx context.Context, path string, offset int64, len
 }
 
 func (d *DavClient) Mkcol(ctx context.Context, path string) (err error) {
-	d.semAcquire()
+	if err = d.semAcquire(ctx); err != nil {
+		return
+	}
 	defer d.semRelease()
 
 	if trace(T_WEBDAV) {
@@ -718,7 +759,9 @@ func (d *DavClient) Mkcol(ctx context.Context, path string) (err error) {
 }
 
 func (d *DavClient) Delete(ctx context.Context, path string) (err error) {
-	d.semAcquire()
+	if err = d.semAcquire(ctx); err != nil {
+		return
+	}
 	defer d.semRelease()
 
 	if trace(T_WEBDAV) {
@@ -744,7 +787,9 @@ func (d *DavClient) Delete(ctx context.Context, path string) (err error) {
 }
 
 func (d *DavClient) Move(ctx context.Context, oldPath, newPath string) (err error) {
-	d.semAcquire()
+	if err = d.semAcquire(ctx); err != nil {
+		return
+	}
 	defer d.semRelease()
 
 	if trace(T_WEBDAV) {
@@ -854,7 +899,9 @@ func (d *DavClient) sabrePutRange(ctx context.Context, path string, data []byte,
 }
 
 func (d *DavClient) PutRange(ctx context.Context, path string, data []byte, offset int64, create bool, excl bool) (created bool, err error) {
-	d.semAcquire()
+	if err = d.semAcquire(ctx); err != nil {
+		return
+	}
 	defer d.semRelease()
 	if d.IsSabre {
 		return d.sabrePutRange(ctx, path, data, offset, create, excl)
@@ -874,7 +921,9 @@ func (d *DavClient) CanPutRange() bool {
 }
 
 func (d *DavClient) Put(ctx context.Context, path string, data []byte, create bool, excl bool) (created bool, err error) {
-	d.semAcquire()
+	if err = d.semAcquire(ctx); err != nil {
+		return
+	}
 	defer d.semRelease()
 
 	if !d.CanPutRange() {

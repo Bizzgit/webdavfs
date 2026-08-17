@@ -151,7 +151,10 @@ func (nd *Node) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (ret fs.Node,
 			}
 		}()
 	}
-	nd.incMetaRefThenLock(req.Header.ID)
+	if err = nd.incMetaRefThenLock(ctx, req.Header.ID); err != nil {
+		nd.Unlock()
+		return
+	}
 	path := joinPath(nd.getPath(), req.Name)
 	nd.Unlock()
 	err = dav.Mkcol(ctx, addSlash(path))
@@ -224,9 +227,16 @@ func (nd *Node) Rename(ctx context.Context, req *fuse.RenameRequest, destDir fs.
 		first = false
 
 		lock1, lock2 = newLock1, newLock2
-		lock1.incMetaRef(req.Header.ID)
+		if err = lock1.incMetaRef(ctx, req.Header.ID); err != nil {
+			nd.Unlock()
+			return
+		}
 		if lock2 != nil {
-			lock2.incMetaRef(req.Header.ID)
+			if err = lock2.incMetaRef(ctx, req.Header.ID); err != nil {
+				lock1.decMetaRef()
+				nd.Unlock()
+				return
+			}
 		}
 	}
 
@@ -275,7 +285,10 @@ func (nd *Node) Remove(ctx context.Context, req *fuse.RemoveRequest) (err error)
 			}
 		}()
 	}
-	nd.incMetaRefThenLock(req.Header.ID)
+	if err = nd.incMetaRefThenLock(ctx, req.Header.ID); err != nil {
+		nd.Unlock()
+		return
+	}
 	path := joinPath(nd.getPath(), req.Name)
 	nd.Unlock()
 	props, err := dav.PropFindWithRedirect(ctx, path, 1, nil)
@@ -341,7 +354,9 @@ func (nd *Node) Getattr(ctx context.Context, req *fuse.GetattrRequest, resp *fus
 		return
 	}
 
-	nd.incIoRef(req.Header.ID)
+	if err = nd.incIoRef(ctx, req.Header.ID); err != nil {
+		return
+	}
 
 	dnode := nd.Dnode
 	if !nd.statInfoFresh() {
@@ -408,7 +423,9 @@ func (nd *Node) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.
 			}
 		}()
 	}
-	nd.incIoRef(req.Header.ID)
+	if err = nd.incIoRef(ctx, req.Header.ID); err != nil {
+		return
+	}
 	defer nd.decIoRef()
 
 	// do we have a recent entry available?
@@ -444,7 +461,9 @@ func (nd *Node) ReadDirAll(ctx context.Context) (dd []fuse.Dirent, err error) {
 			}
 		}()
 	}
-	nd.incIoRef(0)
+	if err = nd.incIoRef(ctx, 0); err != nil {
+		return
+	}
 	defer nd.decIoRef()
 
 	path := nd.getPath()
@@ -488,7 +507,10 @@ func (nd *Node) ReadDirAll(ctx context.Context) (dd []fuse.Dirent, err error) {
 }
 
 func (nd *Node) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (node fs.Node, handle fs.Handle, err error) {
-	nd.incMetaRefThenLock(req.Header.ID)
+	if err = nd.incMetaRefThenLock(ctx, req.Header.ID); err != nil {
+		nd.Unlock()
+		return
+	}
 	path := nd.getPath()
 	nd.Unlock()
 	trunc := flagSet(req.Flags, fuse.OpenTruncate)
@@ -563,7 +585,10 @@ func (nd *Node) Forget() {
 }
 
 func (nd *Node) ftruncate(ctx context.Context, size uint64, id fuse.RequestID) (err error) {
-	nd.incMetaRefThenLock(id)
+	if err = nd.incMetaRefThenLock(ctx, id); err != nil {
+		nd.Unlock()
+		return
+	}
 	path := nd.getPath()
 	nd.Unlock()
 	if size == 0 {
@@ -708,7 +733,9 @@ func (nf *Node) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Read
 		err = fuse.Errno(syscall.ESTALE)
 		return
 	}
-	nf.incIoRef(req.Header.ID)
+	if err = nf.incIoRef(ctx, req.Header.ID); err != nil {
+		return
+	}
 	defer nf.decIoRef()
 	nf.Lock()
 	toRead := int64(nf.Size) - req.Offset
@@ -747,7 +774,9 @@ func (nf *Node) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wr
 		resp.Size = 0
 		return
 	}
-	nf.incIoRef(req.Header.ID)
+	if err = nf.incIoRef(ctx, req.Header.ID); err != nil {
+		return
+	}
 	path := nf.getPath()
 	_, err = dav.PutRange(ctx, path, req.Data, req.Offset, false, false)
 	if err == nil {
@@ -783,7 +812,9 @@ func (nf *Node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.Open
 		return
 	}
 
-	nf.incIoRef(req.Header.ID)
+	if err = nf.incIoRef(ctx, req.Header.ID); err != nil {
+		return
+	}
 	path := nf.getPath()
 
 	// See if kernel cache is still valid.

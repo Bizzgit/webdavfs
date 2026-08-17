@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"runtime/debug"
 	"runtime/pprof"
@@ -38,21 +39,16 @@ var rootNode = &Node{
 }
 
 var EBUSY = fuse.Errno(syscall.EBUSY)
+var EINTR = fuse.Errno(syscall.EINTR)
 var nodeMutex sync.Mutex
 // nodeCond signals waiters (incIoRef/incMetaRef) whenever a ref count
-// changes, replacing the old sleep-and-poll busy loop. It is bound to
-// the raw nodeMutex rather than Node.Lock/Unlock, so it bypasses the
-// T_LOCK debug bookkeeping (lockRef/lockTimer) while waiting - harmless
-// for normal operation, just means the "held too long" trace watchdog
-// isn't fully accurate across a Wait().
+// changes, replacing the old sleep-and-poll busy loop.
 var nodeCond = sync.NewCond(&nodeMutex)
 var lockRef = 0
 var lockTimer *time.Timer
 
-func (nd *Node) Lock() {
-	nodeMutex.Lock()
+func lockWatchdogStart(name string) {
 	if trace(T_LOCK) {
-		name := nd.Name
 		stack := debug.Stack()
 		lockTimer = time.AfterFunc(2 * time.Second, func() {
 			tPrintf("LOCKERR (%s) Lock held longer than 2 seconds:\n%s",
@@ -62,10 +58,9 @@ func (nd *Node) Lock() {
 		})
 	}
 	lockRef++
-	// dbgPrintf("node: Lock %s @ %p ref %d\n", nd.Name, nd, lockRef)
 }
 
-func (nd *Node) Unlock() {
+func lockWatchdogStop() {
 	if trace(T_LOCK) {
 		if lockRef != 1 {
 			tPrintf("LOCKERR unlock: lockRef %d != 1\n%s",
@@ -80,8 +75,50 @@ func (nd *Node) Unlock() {
 		}
 	}
 	lockRef--
+}
+
+func (nd *Node) Lock() {
+	nodeMutex.Lock()
+	lockWatchdogStart(nd.Name)
+	// dbgPrintf("node: Lock %s @ %p ref %d\n", nd.Name, nd, lockRef)
+}
+
+func (nd *Node) Unlock() {
+	lockWatchdogStop()
 	// dbgPrintf("node: Unlock %s @ %p ref %d\n", nd.Name, nd, lockRef)
 	nodeMutex.Unlock()
+}
+
+// waitCond calls nodeCond.Wait(), which unlocks/relocks nodeMutex
+// directly and so bypasses Node.Lock()/Unlock(). To keep the T_LOCK
+// watchdog (lockRef/lockTimer) consistent with the mutex actually being
+// released during the wait, "release" that bookkeeping before Wait()
+// and "reacquire" it after - otherwise ordinary contention produces
+// false LOCKERR spam and leaks an unstopped 2s timer that fires (and
+// dumps every goroutine) on any wait over 2 seconds, which stops being
+// a rare diagnostic signal and starts being the normal case.
+func (nd *Node) waitCond() {
+	lockWatchdogStop()
+	nodeCond.Wait()
+	lockWatchdogStart(nd.Name)
+}
+
+// ctxWatch spawns a goroutine that calls nodeCond.Broadcast() once ctx
+// is done, so a goroutine blocked in nodeCond.Wait() - which has no
+// native way to observe context cancellation - gets woken up promptly
+// instead of only when some unrelated node's ref count happens to
+// change. The caller must call the returned stop function once it's
+// done waiting, so the goroutine can exit.
+func ctxWatch(ctx context.Context) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			nodeCond.Broadcast()
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
 }
 
 func (nd *Node) addNode(d Dnode, really bool) *Node {
@@ -233,13 +270,25 @@ func (de *Node) doesMeta() bool {
 	return false
 }
 
-func (de *Node) incIoRef(id fuse.RequestID) (err error) {
+// incIoRef blocks until no meta operation is in progress on this node
+// or any ancestor, then registers an I/O op. Returns EINTR if ctx is
+// cancelled before that - the caller must not treat the ref as held in
+// that case (nothing to undo: RefCount is only bumped on success).
+func (de *Node) incIoRef(ctx context.Context, id fuse.RequestID) (err error) {
 	de.Lock()
+	defer de.Unlock()
+	stop := ctxWatch(ctx)
+	defer stop()
 	for de.doesMeta() {
-		nodeCond.Wait()
+		if ctx.Err() != nil {
+			return EINTR
+		}
+		de.waitCond()
+	}
+	if ctx.Err() != nil {
+		return EINTR
 	}
 	de.RefCount[RefIO]++
-	de.Unlock()
 	return
 }
 
@@ -250,25 +299,44 @@ func (de *Node) decIoRef() {
 	de.Unlock()
 }
 
-// Waits for i/o to cease, then increases metaref.
-// Caller must already hold de.Lock() (see incMetaRefThenLock).
-func (de *Node) incMetaRef(id fuse.RequestID) error {
+// Waits for other meta ops to clear, registers this one, then waits for
+// i/o to cease before returning. Caller must already hold de.Lock()
+// (see incMetaRefThenLock). On cancellation, any partially-acquired
+// state (the meta ref, if already bumped) is rolled back before
+// returning EINTR, so a cancelled caller never leaks a held ref.
+func (de *Node) incMetaRef(ctx context.Context, id fuse.RequestID) error {
+	stop := ctxWatch(ctx)
+	defer stop()
 	// first wait for other meta operations
 	for de.doesMeta() {
-		nodeCond.Wait()
+		if ctx.Err() != nil {
+			return EINTR
+		}
+		de.waitCond()
+	}
+	if ctx.Err() != nil {
+		return EINTR
 	}
 	de.RefCount[RefMeta]++
 	// now wait for i/o operations to cease.
 	for de.doesIO() {
-		nodeCond.Wait()
+		if ctx.Err() != nil {
+			de.RefCount[RefMeta]--
+			nodeCond.Broadcast()
+			return EINTR
+		}
+		de.waitCond()
 	}
 	// dbgPrintf("node: incMetaRef %s@%p: ref now %d\n", de.Name, de, de.RefCount[RefMeta])
 	return nil
 }
 
-func (de *Node) incMetaRefThenLock(id fuse.RequestID) (err error) {
+// incMetaRefThenLock always returns with de.Lock() held, regardless of
+// err - callers must Unlock() in both the error and success path (see
+// call sites in fuse.go).
+func (de *Node) incMetaRefThenLock(ctx context.Context, id fuse.RequestID) (err error) {
 	de.Lock()
-	err = de.incMetaRef(id)
+	err = de.incMetaRef(ctx, id)
 	return
 }
 
