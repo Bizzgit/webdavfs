@@ -17,6 +17,7 @@ type Opts struct {
 	Type		string
 	TraceOpts	string
 	TraceFile	string
+	ConfigFile	string
 	Daemonize	bool
 	Fake		bool
 	NoMtab		bool
@@ -41,6 +42,8 @@ func usage(err error, code int) {
 	fmt.Fprintf(os.Stderr, "       -T opts:      trace options\n")
 	fmt.Fprintf(os.Stderr, "       -F file:      trace file\n")
 	fmt.Fprintf(os.Stderr, "       -o opts:      mount options\n")
+	fmt.Fprintf(os.Stderr, "       -C file:      config file (same syntax as -o, one option per line);\n")
+	fmt.Fprintf(os.Stderr, "                     -o options override values from the config file\n")
 	fmt.Fprintf(os.Stderr, "       -V|--version  print version\n")
 	fmt.Fprintf(os.Stderr, "       -h|--help     print help message\n")
 	os.Exit(code)
@@ -78,6 +81,9 @@ func rebuildOptions(url, path string) {
 	}
 	if opts.TraceFile != "" {
 		args = append(args, "-F" + opts.TraceFile)
+	}
+	if opts.ConfigFile != "" {
+		args = append(args, "-C" + opts.ConfigFile)
 	}
 	stropts := []string{}
 	for _, o := range strings.Split(opts.RawOptions, ",") {
@@ -122,6 +128,7 @@ func main() {
 	getopt.Flag(&opts.Daemonize, 'D', "daemonize")
 	getopt.Flag(&opts.TraceFile, 'F', "trace file")
 	getopt.Flag(&opts.TraceOpts, 'T', "trace options")
+	getopt.Flag(&opts.ConfigFile, 'C', "config file")
 	getopt.Flag(&opts.NoMtab, 'n', "do not uodate /etc/mtab (obsolete)")
 	getopt.Flag(&opts.Sloppy, 's', "ignore unknown mount options")
 	getopt.Flag(&opts.Fake, 'f', "do everything but the actual mount")
@@ -166,11 +173,19 @@ func main() {
 	url := getopt.Arg(0)
 	mountpoint := getopt.Arg(1)
 
-	// parse mount options, then add defaults.
-	mountOpts, err := parseMountOptions(opts.RawOptions, opts.Sloppy)
+	// parse mount options: config file first (if any), then -o on top of
+	// it so command-line options always win over the config file.
+	var mo MountOptions
+	if opts.ConfigFile != "" {
+		if err := parseConfigFile(&mo, opts.ConfigFile); err != nil {
+			fatal(err.Error())
+		}
+	}
+	err = parseMountOptions(&mo, opts.RawOptions, opts.Sloppy)
 	if err != nil {
 		fatal(err.Error())
 	}
+	mountOpts := mo
 	if mountOpts.MaxConns == 0 {
 		mountOpts.MaxConns = 8
 	}
@@ -274,6 +289,7 @@ func main() {
 		Cookie: cookie,
 		PutDisabled: mountOpts.ReadWriteDirOps,
 		IsSabre: mountOpts.SabreDavPartialUpdate,
+		TLSSkipVerify: mountOpts.TLSSkipVerify,
 	}
 	err = dav.Mount()
 	if err != nil {

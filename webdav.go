@@ -3,6 +3,8 @@ package main;
 import (
 	"fmt"
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/xml"
 	"errors"
 	"io"
@@ -32,6 +34,7 @@ type DavClient struct {
 	PutDisabled	bool
 	MaxConns	int
 	MaxIdleConns	int
+	TLSSkipVerify	bool
 	base		string
 	cc		*http.Client
 	davSem		davSem
@@ -246,7 +249,7 @@ func (d *DavClient) semRelease() {
 	return
 }
 
-func (d *DavClient) buildRequest(method string, path string, b ...interface{}) (req *http.Request, err error) {
+func (d *DavClient) buildRequest(ctx context.Context, method string, path string, b ...interface{}) (req *http.Request, err error) {
 	if len(path) == 0 || path[0] != '/' {
 		err = errors.New("path does not start with /")
 		return
@@ -267,7 +270,7 @@ func (d *DavClient) buildRequest(method string, path string, b ...interface{}) (
 		}
 	}
 	u := url.URL{ Path: path }
-	req, err = http.NewRequest(method, d.Url + u.EscapedPath(), body)
+	req, err = http.NewRequestWithContext(ctx, method, d.Url + u.EscapedPath(), body)
 	if err != nil {
 		return
 	}
@@ -288,8 +291,8 @@ func (d *DavClient) buildRequest(method string, path string, b ...interface{}) (
 	return
 }
 
-func (d *DavClient) request(method string, path string, b ...interface{}) (*http.Response, error) {
-	req, err := d.buildRequest(method, path, b...)
+func (d *DavClient) request(ctx context.Context, method string, path string, b ...interface{}) (*http.Response, error) {
+	req, err := d.buildRequest(ctx, method, path, b...)
 	if err != nil {
 		return nil, err
 	}
@@ -341,19 +344,29 @@ func (d *DavClient) Mount() (err error) {
 			d.davSem = make(davSem, d.MaxConns)
 		}
 		// Override some values from DefaultTransport.
-		tr := *(http.DefaultTransport.(*http.Transport))
+		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.MaxIdleConnsPerHost = d.MaxIdleConns
 		tr.DisableCompression = true
+		if d.MaxConns > 0 {
+			// The semaphore below caps concurrent DAV requests, but the
+			// transport itself has no hard connection limit by default -
+			// give it one too, so "maxconns" actually bounds the number
+			// of TCP connections, not just in-flight requests.
+			tr.MaxConnsPerHost = d.MaxConns
+		}
+		if d.TLSSkipVerify {
+			tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		}
 
 		d.cc = &http.Client{
 			Timeout: 60 * time.Second,
-			Transport: &tr,
+			Transport: tr,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return errors.New("400 Will not follow redirect")
 			},
 		}
 	}
-	req, err := d.buildRequest("OPTIONS", "/")
+	req, err := d.buildRequest(context.Background(), "OPTIONS", "/")
 	if err != nil {
 		return err
 	}
@@ -390,7 +403,7 @@ func (d *DavClient) Mount() (err error) {
 	// check if it exists and is a directory.
 	if err == nil {
 		var dnode Dnode
-		dnode, err = d.Stat("/")
+		dnode, err = d.Stat(context.Background(), "/")
 		if err == nil && !dnode.IsDir {
 			err = errors.New(d.Url + " is not a directory")
 		}
@@ -399,7 +412,7 @@ func (d *DavClient) Mount() (err error) {
 	return
 }
 
-func (d *DavClient) PropFind(path string, depth int, props []string) (ret []*Props, err error) {
+func (d *DavClient) PropFind(ctx context.Context, path string, depth int, props []string) (ret []*Props, err error) {
 
 	d.semAcquire()
 	defer d.semRelease()
@@ -435,7 +448,7 @@ func (d *DavClient) PropFind(path string, depth int, props []string) (ret []*Pro
 	a = append(a, `</D:propfind>`)
 	x := strings.Join(a, "")
 
-	req, err := d.buildRequest("PROPFIND", path, x)
+	req, err := d.buildRequest(ctx, "PROPFIND", path, x)
 	if err != nil {
 		return
 	}
@@ -514,8 +527,8 @@ func (d *DavClient) PropFind(path string, depth int, props []string) (ret []*Pro
 	return
 }
 
-func (d *DavClient) PropFindWithRedirect(path string, depth int, props []string) (ret []*Props, err error) {
-	ret, err = d.PropFind(path, depth, props)
+func (d *DavClient) PropFindWithRedirect(ctx context.Context, path string, depth int, props []string) (ret []*Props, err error) {
+	ret, err = d.PropFind(ctx, path, depth, props)
 
 	// did we get a redirect?
 	if daverr, ok := err.(*DavError); ok {
@@ -528,13 +541,13 @@ func (d *DavClient) PropFindWithRedirect(path string, depth int, props []string)
 		}
 		// if it's just a "this is a directory" redirect, retry.
 		if url.Path == d.base + path + "/" {
-			ret, err = d.PropFind(path + "/", depth, props)
+			ret, err = d.PropFind(ctx, path + "/", depth, props)
 		}
 	}
 	return
 }
 
-func (d *DavClient) Readdir(path string, detail bool) (ret []Dnode, err error) {
+func (d *DavClient) Readdir(ctx context.Context, path string, detail bool) (ret []Dnode, err error) {
 
 	if trace(T_WEBDAV) {
 		tPrintf("Readdir(%s, %v", path, detail)
@@ -548,7 +561,7 @@ func (d *DavClient) Readdir(path string, detail bool) (ret []Dnode, err error) {
 	}
 
 	path = addSlash(path)
-	props, err := d.PropFind(path, 1, nil)
+	props, err := d.PropFind(ctx, path, 1, nil)
 	if err != nil {
 		return
 	}
@@ -583,7 +596,7 @@ func (d *DavClient) Readdir(path string, detail bool) (ret []Dnode, err error) {
 	return
 }
 
-func (d *DavClient) Stat(path string) (ret Dnode, err error) {
+func (d *DavClient) Stat(ctx context.Context, path string) (ret Dnode, err error) {
 
 	if trace(T_WEBDAV) {
 		tPrintf("Stat(%s)", path)
@@ -596,7 +609,7 @@ func (d *DavClient) Stat(path string) (ret Dnode, err error) {
 		}()
 	}
 
-	props, err := d.PropFindWithRedirect(path, 0, nil)
+	props, err := d.PropFindWithRedirect(ctx, path, 0, nil)
 	if err != nil {
 		return
 	}
@@ -616,7 +629,7 @@ func (d *DavClient) Stat(path string) (ret Dnode, err error) {
 	return
 }
 
-func (d *DavClient) Get(path string) (data []byte, err error) {
+func (d *DavClient) Get(ctx context.Context, path string) (data []byte, err error) {
 	if trace(T_WEBDAV) {
 		tPrintf("Get(%s)", path)
 		defer func() {
@@ -628,10 +641,10 @@ func (d *DavClient) Get(path string) (data []byte, err error) {
 		}()
 	}
 
-	return d.GetRange(path, -1, -1)
+	return d.GetRange(ctx, path, -1, -1)
 }
 
-func (d *DavClient) GetRange(path string, offset int64, length int) (data []byte, err error) {
+func (d *DavClient) GetRange(ctx context.Context, path string, offset int64, length int) (data []byte, err error) {
 	d.semAcquire()
 	defer d.semRelease()
 
@@ -645,7 +658,7 @@ func (d *DavClient) GetRange(path string, offset int64, length int) (data []byte
 			tPrintf("GetRange: returns %d bytes", len(data))
 		}()
 	}
-	req, err := d.buildRequest("GET", path)
+	req, err := d.buildRequest(ctx, "GET", path)
 	if err != nil {
 		return
 	}
@@ -678,7 +691,7 @@ func (d *DavClient) GetRange(path string, offset int64, length int) (data []byte
 	return
 }
 
-func (d *DavClient) Mkcol(path string) (err error) {
+func (d *DavClient) Mkcol(ctx context.Context, path string) (err error) {
 	d.semAcquire()
 	defer d.semRelease()
 
@@ -692,7 +705,7 @@ func (d *DavClient) Mkcol(path string) (err error) {
 			tPrintf("Mkcol: OK")
 		}()
 	}
-	req, err := d.buildRequest("MKCOL", path)
+	req, err := d.buildRequest(ctx, "MKCOL", path)
 	if err != nil {
 		return
 	}
@@ -704,7 +717,7 @@ func (d *DavClient) Mkcol(path string) (err error) {
 	return
 }
 
-func (d *DavClient) Delete(path string) (err error) {
+func (d *DavClient) Delete(ctx context.Context, path string) (err error) {
 	d.semAcquire()
 	defer d.semRelease()
 
@@ -718,7 +731,7 @@ func (d *DavClient) Delete(path string) (err error) {
 			tPrintf("Delete: OK")
 		}()
 	}
-	req, err := d.buildRequest("DELETE", path)
+	req, err := d.buildRequest(ctx, "DELETE", path)
 	if err != nil {
 		return
 	}
@@ -730,7 +743,7 @@ func (d *DavClient) Delete(path string) (err error) {
 	return
 }
 
-func (d *DavClient) Move(oldPath, newPath string) (err error) {
+func (d *DavClient) Move(ctx context.Context, oldPath, newPath string) (err error) {
 	d.semAcquire()
 	defer d.semRelease()
 
@@ -744,7 +757,7 @@ func (d *DavClient) Move(oldPath, newPath string) (err error) {
 			tPrintf("Move: OK")
 		}()
 	}
-	req, err := d.buildRequest("MOVE", oldPath)
+	req, err := d.buildRequest(ctx, "MOVE", oldPath)
 	if err != nil {
 		return
 	}
@@ -770,7 +783,7 @@ func (d *DavClient) Move(oldPath, newPath string) (err error) {
 }
 
 // https://blog.sphere.chronosempire.org.uk/2012/11/21/webdav-and-the-http-patch-nightmare
-func (d *DavClient) apachePutRange(path string, data []byte, offset int64, create bool, excl bool) (created bool, err error) {
+func (d *DavClient) apachePutRange(ctx context.Context, path string, data []byte, offset int64, create bool, excl bool) (created bool, err error) {
 	if trace(T_WEBDAV) {
 		tPrintf("apachePutRange(%s, %d, %d, %v, %v)", path, len(data), offset, create, excl)
 		defer func() {
@@ -781,7 +794,7 @@ func (d *DavClient) apachePutRange(path string, data []byte, offset int64, creat
 			tPrintf("apachePutRange: OK, created: %v", created)
 		}()
 	}
-	req, err := d.buildRequest("PUT", path, data)
+	req, err := d.buildRequest(ctx, "PUT", path, data)
 
 	end := offset + int64(len(data)) - 1
 	if end < offset {
@@ -806,7 +819,7 @@ func (d *DavClient) apachePutRange(path string, data []byte, offset int64, creat
 }
 
 // http://sabre.io/dav/http-patch/
-func (d *DavClient) sabrePutRange(path string, data []byte, offset int64, create bool, excl bool) (created bool, err error) {
+func (d *DavClient) sabrePutRange(ctx context.Context, path string, data []byte, offset int64, create bool, excl bool) (created bool, err error) {
 
 	if trace(T_WEBDAV) {
 		tPrintf("sabrePutRange(%s, %d, %d, %v, %v)", path, len(data), offset, create, excl)
@@ -819,7 +832,7 @@ func (d *DavClient) sabrePutRange(path string, data []byte, offset int64, create
 		}()
 	}
 
-	req, err := d.buildRequest("PATCH", path, data)
+	req, err := d.buildRequest(ctx, "PATCH", path, data)
 
 	if create {
 		if excl {
@@ -840,14 +853,14 @@ func (d *DavClient) sabrePutRange(path string, data []byte, offset int64, create
 	return
 }
 
-func (d *DavClient) PutRange(path string, data []byte, offset int64, create bool, excl bool) (created bool, err error) {
+func (d *DavClient) PutRange(ctx context.Context, path string, data []byte, offset int64, create bool, excl bool) (created bool, err error) {
 	d.semAcquire()
 	defer d.semRelease()
 	if d.IsSabre {
-		return d.sabrePutRange(path, data, offset, create, excl)
+		return d.sabrePutRange(ctx, path, data, offset, create, excl)
 	}
 	if d.IsApache {
-		return d.apachePutRange(path, data, offset, create, excl)
+		return d.apachePutRange(ctx, path, data, offset, create, excl)
 	}
 	err = davToErrno(&DavError{
 		Message: "405 Method Not Allowed",
@@ -860,7 +873,7 @@ func (d *DavClient) CanPutRange() bool {
 	return (d.IsSabre || d.IsApache) && !d.PutDisabled
 }
 
-func (d *DavClient) Put(path string, data []byte, create bool, excl bool) (created bool, err error) {
+func (d *DavClient) Put(ctx context.Context, path string, data []byte, create bool, excl bool) (created bool, err error) {
 	d.semAcquire()
 	defer d.semRelease()
 
@@ -872,7 +885,7 @@ func (d *DavClient) Put(path string, data []byte, create bool, excl bool) (creat
 		return
 	}
 
-	req, err := d.buildRequest("PUT", path, data)
+	req, err := d.buildRequest(ctx, "PUT", path, data)
 	if create {
 		if excl {
 			req.Header.Set("If-None-Match", "*")

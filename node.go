@@ -39,6 +39,13 @@ var rootNode = &Node{
 
 var EBUSY = fuse.Errno(syscall.EBUSY)
 var nodeMutex sync.Mutex
+// nodeCond signals waiters (incIoRef/incMetaRef) whenever a ref count
+// changes, replacing the old sleep-and-poll busy loop. It is bound to
+// the raw nodeMutex rather than Node.Lock/Unlock, so it bypasses the
+// T_LOCK debug bookkeeping (lockRef/lockTimer) while waiting - harmless
+// for normal operation, just means the "held too long" trace watchdog
+// isn't fully accurate across a Wait().
+var nodeCond = sync.NewCond(&nodeMutex)
 var lockRef = 0
 var lockTimer *time.Timer
 
@@ -227,69 +234,33 @@ func (de *Node) doesMeta() bool {
 }
 
 func (de *Node) incIoRef(id fuse.RequestID) (err error) {
-	count := 0
-	for {
-		de.Lock()
-		if !de.doesMeta() {
-			de.RefCount[RefIO]++
-			de.Unlock()
-			break
-		}
-		de.Unlock()
-		time.Sleep(10 * time.Millisecond)
-		if trace(T_LOCK) {
-			count++
-			if count > 300 {
-				tPrintf("%d LOCKERR incIoRef(%s) locked for 3 secs", id, de.Name)
-				count = 0
-			}
-		}
+	de.Lock()
+	for de.doesMeta() {
+		nodeCond.Wait()
 	}
+	de.RefCount[RefIO]++
+	de.Unlock()
 	return
 }
 
 func (de *Node) decIoRef() {
 	de.Lock()
 	de.RefCount[RefIO]--
+	nodeCond.Broadcast()
 	de.Unlock()
 }
 
 // Waits for i/o to cease, then increases metaref.
+// Caller must already hold de.Lock() (see incMetaRefThenLock).
 func (de *Node) incMetaRef(id fuse.RequestID) error {
 	// first wait for other meta operations
-	count := 0
-	for {
-		if !de.doesMeta() {
-			de.RefCount[RefMeta]++
-			break
-		}
-		de.Unlock()
-		time.Sleep(10 * time.Millisecond)
-		if trace(T_LOCK) {
-			count++
-			if count > 200 {
-				tPrintf("%d LOCKERR incMetaRef(%s) metawait locked for 2 secs", id, de.Name)
-				count = 0
-			}
-		}
-		de.Lock()
+	for de.doesMeta() {
+		nodeCond.Wait()
 	}
+	de.RefCount[RefMeta]++
 	// now wait for i/o operations to cease.
-	count = 0
-	for {
-		if !de.doesIO() {
-			break
-		}
-		de.Unlock()
-		time.Sleep(10 * time.Millisecond)
-		if trace(T_LOCK) {
-			count++
-			if count > 200 {
-				tPrintf("%d LOCKERR incMetaRef(%s) iowait locked for 2 secs", id, de.Name)
-				count = 0
-			}
-		}
-		de.Lock()
+	for de.doesIO() {
+		nodeCond.Wait()
 	}
 	// dbgPrintf("node: incMetaRef %s@%p: ref now %d\n", de.Name, de, de.RefCount[RefMeta])
 	return nil
@@ -303,6 +274,7 @@ func (de *Node) incMetaRefThenLock(id fuse.RequestID) (err error) {
 
 func (de *Node) decMetaRef() {
 	de.RefCount[RefMeta]--
+	nodeCond.Broadcast()
 	// dbgPrintf("node: decMetaRef %s@%p: ref now %d\n", de.Name, de, de.RefCount[RefMeta])
 }
 
