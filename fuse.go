@@ -107,7 +107,7 @@ func (fs *WebdavFS) Statfs(ctx context.Context, req *fuse.StatfsRequest, resp *f
 		}()
 	}
 	wanted := []string{ "quota-available-bytes", "quota-used-bytes" }
-	props, err := dav.PropFind("/", 0, wanted)
+	props, err := dav.PropFind(ctx, "/", 0, wanted)
 	if err != nil {
 		return
 	}
@@ -154,7 +154,7 @@ func (nd *Node) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (ret fs.Node,
 	nd.incMetaRefThenLock(req.Header.ID)
 	path := joinPath(nd.getPath(), req.Name)
 	nd.Unlock()
-	err = dav.Mkcol(addSlash(path))
+	err = dav.Mkcol(ctx, addSlash(path))
 	nd.Lock()
 	if err == nil {
 		now := time.Now()
@@ -237,7 +237,7 @@ func (nd *Node) Rename(ctx context.Context, req *fuse.RenameRequest, destDir fs.
 		// find out if it's a dir or not, so stat.
 		nd.Unlock()
 		var dnode Dnode
-		dnode, err = dav.Stat(oldPath)
+		dnode, err = dav.Stat(ctx, oldPath)
 		isDir = dnode.IsDir
 	} else {
 		isDir = node.IsDir
@@ -249,7 +249,7 @@ func (nd *Node) Rename(ctx context.Context, req *fuse.RenameRequest, destDir fs.
 			oldPath = addSlash(oldPath)
 			newPath = addSlash(newPath)
 		}
-		err = dav.Move(oldPath, newPath)
+		err = dav.Move(ctx, oldPath, newPath)
 	}
 
 	nd.Lock()
@@ -278,7 +278,7 @@ func (nd *Node) Remove(ctx context.Context, req *fuse.RemoveRequest) (err error)
 	nd.incMetaRefThenLock(req.Header.ID)
 	path := joinPath(nd.getPath(), req.Name)
 	nd.Unlock()
-	props, err := dav.PropFindWithRedirect(path, 1, nil)
+	props, err := dav.PropFindWithRedirect(ctx, path, 1, nil)
 	if err == nil {
 		if len(props) != 1 {
 			if req.Dir {
@@ -304,7 +304,7 @@ func (nd *Node) Remove(ctx context.Context, req *fuse.RemoveRequest) (err error)
 		if req.Dir {
 			path = addSlash(path)
 		}
-		err = dav.Delete(path)
+		err = dav.Delete(ctx, path)
 	}
 	nd.Lock()
 	if err == nil {
@@ -349,7 +349,7 @@ func (nd *Node) Getattr(ctx context.Context, req *fuse.GetattrRequest, resp *fus
 		if nd.IsDir {
 			path = addSlash(path)
 		}
-		dnode, err = dav.Stat(path)
+		dnode, err = dav.Stat(ctx, path)
 		if err == nil {
 			nd.statInfoTouch()
 		}
@@ -423,7 +423,7 @@ func (nd *Node) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.
 
 	// need to call stat
 	path := joinPath(nd.getPath(), req.Name)
-	dnode, err := dav.Stat(path)
+	dnode, err := dav.Stat(ctx, path)
 
 	if err == nil {
 		node := nd.addNode(dnode, true)
@@ -448,7 +448,7 @@ func (nd *Node) ReadDirAll(ctx context.Context) (dd []fuse.Dirent, err error) {
 	defer nd.decIoRef()
 
 	path := nd.getPath()
-	dirs, err := dav.Readdir(path, true)
+	dirs, err := dav.Readdir(ctx, path, true)
 	if err != nil {
 		return
 	}
@@ -511,18 +511,18 @@ func (nd *Node) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.
 	if trunc {
 		// A simple put with no body creates and truncates the
 		// file if it's not there.
-		created, err = dav.Put(path, []byte{}, true, excl)
+		created, err = dav.Put(ctx, path, []byte{}, true, excl)
 	} else {
 		// A Put-Range at offset 0 with an empty body
 		// creates the file if not present, but doesn't
 		// truncate it.
-		created, err = dav.PutRange(path, []byte{}, 0, true, excl)
+		created, err = dav.PutRange(ctx, path, []byte{}, 0, true, excl)
 	}
 	if err == nil && excl && !created {
 		err = fuse.EEXIST
 	}
 	if err == nil {
-		dnode, err := dav.Stat(path)
+		dnode, err := dav.Stat(ctx, path)
 		if err == nil {
 			n := nd.addNode(dnode, true)
 			node = n
@@ -542,9 +542,22 @@ func (nd *Node) Forget() {
 	if trace(T_FUSE) {
 		tPrintf("Forget(%s)", nd.Name)
 	}
-	// XXX FIXME add some sanity checks here-
-	// see if refcnt == 0, subdirs are gone
 	nd.Lock()
+	// The kernel only calls Forget() once its own refcount for this
+	// node hits zero, so these should never fire. If they do, we're
+	// about to drop a node that's still in active use or still has
+	// children - forgetNode() would then leave dangling references
+	// in the (now orphaned) subtree. Trace it instead of silently
+	// corrupting the tree; still forget it, since the kernel has
+	// already forgotten it on its side regardless.
+	if nd.RefCount[RefIO] != 0 || nd.RefCount[RefMeta] != 0 {
+		tPrintf("Forget(%s): WARNING refcount not zero (io=%d meta=%d)",
+			nd.Name, nd.RefCount[RefIO], nd.RefCount[RefMeta])
+	}
+	if len(nd.Child) != 0 {
+		tPrintf("Forget(%s): WARNING %d children still present",
+			nd.Name, len(nd.Child))
+	}
 	nd.forgetNode()
 	nd.Unlock()
 }
@@ -555,10 +568,10 @@ func (nd *Node) ftruncate(ctx context.Context, size uint64, id fuse.RequestID) (
 	nd.Unlock()
 	if size == 0 {
 		if nd.Size > 0 {
-			_, err = dav.Put(path, []byte{}, false, false)
+			_, err = dav.Put(ctx, path, []byte{}, false, false)
 		}
 	} else if size > nd.Size {
-		_, err = dav.PutRange(path, []byte{0}, int64(size - 1), false, false)
+		_, err = dav.PutRange(ctx, path, []byte{0}, int64(size - 1), false, false)
 	} else if size != nd.Size {
 		err = fuse.ERANGE
 	}
@@ -592,7 +605,7 @@ func (nd *Node) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fus
 	v := req.Valid
 	if attrSet(v, invalid) {
 		if trace(T_FUSE) {
-			tPrintf("%d Setattr($s): invalid attributes (mode %d, invalid %d)",
+			tPrintf("%d Setattr(%s): invalid attributes (mode %d, invalid %d)",
 				req.Header.ID, nd.Name, v, invalid)
 		}
 		return fuse.EPERM
@@ -708,7 +721,7 @@ func (nf *Node) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Read
 		toRead = int64(req.Size)
 	}
 	path := nf.getPath()
-	data, err := dav.GetRange(path, req.Offset, int(toRead))
+	data, err := dav.GetRange(ctx, path, req.Offset, int(toRead))
 	if err == nil {
 		resp.Data = data
 	}
@@ -736,7 +749,7 @@ func (nf *Node) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wr
 	}
 	nf.incIoRef(req.Header.ID)
 	path := nf.getPath()
-	_, err = dav.PutRange(path, req.Data, req.Offset, false, false)
+	_, err = dav.PutRange(ctx, path, req.Data, req.Offset, false, false)
 	if err == nil {
 		resp.Size = len(req.Data)
 		sz := uint64(req.Offset) + uint64(len(req.Data))
@@ -774,7 +787,7 @@ func (nf *Node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.Open
 	path := nf.getPath()
 
 	// See if kernel cache is still valid.
-	dnode, err := dav.Stat(path)
+	dnode, err := dav.Stat(ctx, path)
 	if err == nil {
 		nf.Lock()
 		nf.Dnode = dnode
@@ -787,7 +800,7 @@ func (nf *Node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.Open
 		// This is actually not called, truncating is
 		// done by calling Setattr with 0 size.
 		if trunc {
-			_, err = dav.Put(path, []byte{}, false, false)
+			_, err = dav.Put(ctx, path, []byte{}, false, false)
 			if err == nil {
 				nf.Size = 0
 			}
