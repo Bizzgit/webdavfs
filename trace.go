@@ -138,6 +138,16 @@ func traceredirectStdoutErr() {
 
 func traceOpts(opt string, fn string) (err error)  {
 	if opt == "" {
+		// Still start a logger even with no trace options: tPrintf() is
+		// called unconditionally from a couple of places (e.g. Forget()'s
+		// sanity-check warnings), and traceChan is only an 8-slot buffer.
+		// Without a goroutine draining it, the 9th unconditional tPrintf
+		// call blocks forever - and since some callers hold nd.Lock()
+		// (the single global filesystem mutex) while logging, that stalls
+		// every other FUSE operation, not just the one that logged.
+		// Post-daemonize, os.Stdout is dup2'd to /dev/null (see Detach()),
+		// so this is a safe, silent discard in the normal case.
+		startLogger(os.Stdout, "stdout")
 		return
 	}
 	opts := strings.Split(opt, ",")
