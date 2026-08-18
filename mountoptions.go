@@ -90,6 +90,18 @@ func applyOption(mo *MountOptions, key, v string) (err error) {
 		// the option list if later options should be able to override
 		// values loaded from it.
 		err = parseConfigFile(mo, v)
+	case "_netdev", "nofail", "noauto", "auto":
+		// Not real webdavfs options - mount(8) and systemd's fstab
+		// generator both pass these straight through in the Options=
+		// string instead of stripping them (verified: a
+		// systemd-fstab-generator run against an fstab line with
+		// _netdev,nofail reproduces the literal option in the
+		// generated .mount unit's Options=). They only mean something
+		// to systemd/mount(8) itself (network dependency ordering,
+		// non-blocking boot, auto/no-auto at mount -a time) - recognize
+		// and ignore them here so an /etc/fstab entry using them
+		// (the normal way to configure a network filesystem mount)
+		// doesn't fail with "unknown option".
 	default:
 		err = errors.New(key + ": unknown option")
 	}
