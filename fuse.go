@@ -446,7 +446,6 @@ func (nd *Node) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.
 		node := nd.addNode(dnode, true)
 		rn = node
 	}
-	nd.decIoRef()
 	return
 }
 
@@ -564,24 +563,33 @@ func (nd *Node) Forget() {
 	if trace(T_FUSE) {
 		tPrintf("Forget(%s)", nd.Name)
 	}
+	// The kernel only calls Forget() once its own refcount for this node
+	// hits zero, so a non-zero RefCount here should never happen. A
+	// non-empty Child map is a different story and is expected in normal
+	// operation: ReadDirAll populates Child speculatively (InUse=false)
+	// for every entry it sees, independent of whether the kernel ever
+	// actually looked each one up - so the kernel can legitimately forget
+	// a directory while our own (more eager) cache still lists children
+	// it never pinned. forgetNode() drops the whole (now unreachable)
+	// subtree either way; nothing leaks, GC reclaims it.
 	nd.Lock()
-	// The kernel only calls Forget() once its own refcount for this
-	// node hits zero, so these should never fire. If they do, we're
-	// about to drop a node that's still in active use or still has
-	// children - forgetNode() would then leave dangling references
-	// in the (now orphaned) subtree. Trace it instead of silently
-	// corrupting the tree; still forget it, since the kernel has
-	// already forgotten it on its side regardless.
-	if nd.RefCount[RefIO] != 0 || nd.RefCount[RefMeta] != 0 {
-		tPrintf("Forget(%s): WARNING refcount not zero (io=%d meta=%d)",
-			nd.Name, nd.RefCount[RefIO], nd.RefCount[RefMeta])
-	}
-	if len(nd.Child) != 0 {
-		tPrintf("Forget(%s): WARNING %d children still present",
-			nd.Name, len(nd.Child))
-	}
+	ioRef, metaRef := nd.RefCount[RefIO], nd.RefCount[RefMeta]
+	numChildren := len(nd.Child)
 	nd.forgetNode()
 	nd.Unlock()
+
+	// Log after releasing the lock, never while holding it: tPrintf()
+	// can block (see traceOpts's comment on traceChan), and a stalled
+	// log call must never be able to hold the single global filesystem
+	// mutex hostage for every other FUSE operation.
+	if ioRef != 0 || metaRef != 0 {
+		tPrintf("Forget(%s): WARNING refcount not zero (io=%d meta=%d)",
+			nd.Name, ioRef, metaRef)
+	}
+	if numChildren != 0 {
+		tPrintf("Forget(%s): %d children still present (expected under speculative caching, see comment above)",
+			nd.Name, numChildren)
+	}
 }
 
 func (nd *Node) ftruncate(ctx context.Context, size uint64, id fuse.RequestID) (err error) {
