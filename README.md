@@ -37,6 +37,9 @@ Basic filesystem operations.
 - files: create/delete/read/write/truncate/seek
 - directories: mkdir rmdir readdir
 - query filesystem size (df / vfsstat)
+- a cancelled operation (client killed, kernel interrupt) stops waiting
+  immediately instead of hanging until the underlying HTTP request or
+  an internal lock wait times out on its own
 
 ## What is not yet working
 
@@ -166,21 +169,58 @@ trace file is an equally sensitive place for them to leak from.
 
 ## TODO
 
-- rewrite fuse.go code to use the bazil/fuse abstraction instead of bazil/fuse/fs.  
-  perhaps switch to  
-  - https://github.com/hanwen/go-fuse
-  - https://github.com/jacobsa/fuse
+- `bazil.org/fuse` (the module this project is built on, `bazil.org/fuse/fs`
+  specifically) has had no commits since Dec 2023 and is effectively
+  unmaintained - no fixes to expect if a future kernel FUSE ABI change or
+  security issue ever affects it. Not an active problem today, so there's
+  no reason to migrate pre-emptively; treat this as a someday/maybe, not a
+  standing task. If it ever does break: [hanwen/go-fuse](https://github.com/hanwen/go-fuse)
+  (`v2`'s `fs` package) is the option to reach for - actively maintained,
+  the closest abstraction match to the `Node`/`Handle` model this fork
+  already uses, and proven in comparable read-heavy remote-storage
+  workloads (JuiceFS, containerd/stargz-snapshotter). This would still be
+  a genuine rewrite of the FUSE-facing layer in `fuse.go`/`node.go`, not a
+  mechanical port - call signatures, error types, and the inode/embedding
+  lifecycle all differ. `jacobsa/fuse` and `bazil.org/fuse`'s own raw
+  (non-`fs`) interface are both lower-level, op-callback wire protocols;
+  moving to either would mean rebuilding request dispatch and inode/lookup
+  bookkeeping from scratch (things `fs.Serve` currently handles), for no
+  benefit specific to this kind of workload - not worth it just to get off
+  an unmaintained dependency.
 
 ## Unix filesystem extensions for webdav.
 
 Not ever going to happen, but if you wanted a more unix-like
-experience and better performance, here are a few ideas:
+experience and better performance, here are a few ideas. Genuine,
+still-unaddressed protocol gaps:
 
-- Content-Type: for unix pipes / chardevs / etc
-- contentsize property (read-write)
-- inodenumber property
-- unix properties like uid/gid/mode
-- DELETE Depth 0 for collections (no delete if non-empty)
-- return updated PROPSTAT information after operations
-  like PUT / DELETE / MKCOL / MOVE
+- Content-Type: for unix pipes / chardevs / etc - no RFC or de facto
+  convention exists for representing special file types over WebDAV.
+- contentsize property (read-write) - `getcontentlength` (RFC 4918 §15.4)
+  is defined as the server-computed length of the GET response body; a
+  client-writable size decoupled from actual bytes would break basic HTTP
+  semantics, not just WebDAV convention, so this was likely never truly
+  implementable as originally imagined.
+- DELETE Depth 0 for collections (no delete if non-empty) - RFC 4918
+  §9.6.1 mandates DELETE on a collection always acts as Depth: infinity;
+  there's no protocol concept of a depth-limited "rmdir if empty" delete.
+
+Partially addressed since this list was written, worth knowing about
+even though not worth building against:
+
+- inodenumber property - no RFC standard, but Nextcloud/ownCloud expose a
+  vendor-specific `oc:fileid` property that serves a similar purpose
+  against those specific servers.
+- unix properties like uid/gid/mode - RFC 3744 (WebDAV ACL) defines
+  `DAV:owner`/`DAV:group` for Unix-privilege-model repositories, but
+  principals are URIs (not numeric uid/gid) and there's no `mode`
+  equivalent - RFC 3744 replaces POSIX mode with a heavier per-principal
+  ACL model instead, with inconsistent server adoption.
+
+Now solved by a later RFC, no longer a gap:
+
+- return updated PROPSTAT information after operations like PUT / DELETE
+  / MKCOL / MOVE - RFC 8144 (2017) standardizes `Prefer: return=minimal` /
+  `return=representation` for WebDAV, letting a client request updated
+  state back in the same round trip.
 
