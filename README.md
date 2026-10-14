@@ -178,6 +178,23 @@ headers, including `Authorization` and `Cookie`, to the trace file - if
 you're keeping credentials out of `ps`/fstab via a config file, the
 trace file is an equally sensitive place for them to leak from.
 
+## Debian package
+
+`packaging/build-deb.sh` builds a `.deb` for the architecture of the machine
+it runs on (needs `go`, `dpkg-deb` and `git`; the package lands in `dist/`):
+
+```
+packaging/build-deb.sh
+sudo apt install ./dist/webdavfs_*.deb
+```
+
+It installs `/usr/sbin/mount.webdavfs` and a logrotate rule for the trace
+file (`/var/log/webdavfs.log`, see `tracefile=` above), and depends on `fuse`
+and `logrotate`. It does not touch `/etc/fstab` and never remounts anything:
+after an upgrade a running mount keeps using the old binary until it is
+mounted again. Removing the package removes `mount.webdavfs`, so a
+`webdavfs` entry in `/etc/fstab` will then fail to mount at the next boot.
+
 ## TODO
 
 - `bazil.org/fuse` (the module this project is built on, `bazil.org/fuse/fs`

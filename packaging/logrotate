@@ -1,0 +1,14 @@
+# Trace file of mount.webdavfs (tracefile=/var/log/webdavfs.log). The daemon
+# keeps the file open, so rotate it in place: copytruncate. Renaming or
+# deleting the file would leave stderr, and with it a crash trace, in the
+# old file (see the tracefile= option in the README).
+/var/log/webdavfs.log {
+    weekly
+    rotate 4
+    maxsize 10M
+    copytruncate
+    missingok
+    notifempty
+    compress
+    delaycompress
+}

@@ -1,0 +1,22 @@
+Package: webdavfs
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: Bizzgit <bizzgit@users.noreply.github.com>
+Depends: fuse, logrotate
+Section: admin
+Priority: optional
+Installed-Size: @SIZE@
+Homepage: https://github.com/Bizzgit/webdavfs
+Description: FUSE filesystem for WebDAV shares (mount.webdavfs)
+ Fork of miquels/webdavfs. Mounts a WebDAV share through FUSE without a
+ local cache, so it can be used from /etc/fstab or a systemd mount unit
+ as filesystem type webdavfs.
+ .
+ Installs /usr/sbin/mount.webdavfs and a logrotate rule for the optional
+ trace file (the tracefile= mount option).
+ .
+ Upgrading replaces the binary but does not remount: a running mount keeps
+ using the old binary until it is mounted again, so an upgrade never
+ interrupts a mounted share. Removing the package removes mount.webdavfs,
+ and an /etc/fstab entry of type webdavfs then fails to mount at the next
+ boot.

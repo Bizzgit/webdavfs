@@ -1,3 +1,4 @@
 /webdavfs
 /webdavfs.new
 *.test
+/dist/
