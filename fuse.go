@@ -586,7 +586,10 @@ func (nd *Node) Forget() {
 		tPrintf("Forget(%s): WARNING refcount not zero (io=%d meta=%d)",
 			nd.Name, ioRef, metaRef)
 	}
-	if numChildren != 0 {
+	// Expected and frequent (see above), so only with -T fuse: with a trace
+	// file but no trace options (tracefile=) the unconditional messages
+	// reach the file, and this one would make it grow without bound.
+	if numChildren != 0 && trace(T_FUSE) {
 		tPrintf("Forget(%s): %d children still present (expected under speculative caching, see comment above)",
 			nd.Name, numChildren)
 	}

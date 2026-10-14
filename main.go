@@ -193,6 +193,12 @@ func main() {
 		mountOpts.MaxIdleConns = 8
 	}
 
+	// tracefile= is the mount-option form of -F; -F wins if both are given.
+	// Done before daemonizing so the re-exec'd child gets it as -F too.
+	if opts.TraceFile == "" {
+		opts.TraceFile = mountOpts.TraceFile
+	}
+
 	if strings.HasPrefix(progname, "mount.") || opts.Daemonize {
 		if !IsDaemon() {
 			rebuildOptions(url, mountpoint)
@@ -203,6 +209,12 @@ func main() {
 	err = traceOpts(opts.TraceOpts, opts.TraceFile)
 	if err != nil {
 		fatal(err.Error())
+	}
+	// Only with a trace file: a log that shows this line is proof that
+	// logging works, and dates the daemon. Without one the logger writes
+	// to stdout, which is still the mount(8) pipe at this point.
+	if traceFile != nil {
+		tPrintf("webdavfs %s started (pid %d) for %s on %s", VERSION, os.Getpid(), url, mountpoint)
 	}
 
 	config := WebdavFS{}

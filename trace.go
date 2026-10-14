@@ -147,6 +147,24 @@ func traceOpts(opt string, fn string) (err error)  {
 		// every other FUSE operation, not just the one that logged.
 		// Post-daemonize, os.Stdout is dup2'd to /dev/null (see Detach()),
 		// so this is a safe, silent discard in the normal case.
+		//
+		// With a trace file (-F or tracefile=) but no trace options, open
+		// the file anyway. Nothing is traced (traceOptions stays 0), but
+		// traceredirectStdoutErr() then points stdout and stderr at it, so
+		// the unconditional messages and, above all, the stack trace of a
+		// panic end up there instead of in /dev/null. Without this a
+		// crashed daemon leaves no trace at all. Not being able to open the
+		// file is reported (the parent relays it to mount(8)) but must not
+		// keep the filesystem from mounting.
+		if fn != "" {
+			fh, ferr := unprivOpenFile(fn, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+			if ferr == nil {
+				traceFile = fh
+				startLogger(traceFile, fn)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "%s: cannot open trace file %s: %v\n", progname, fn, ferr)
+		}
 		startLogger(os.Stdout, "stdout")
 		return
 	}

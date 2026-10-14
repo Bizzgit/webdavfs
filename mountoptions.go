@@ -27,6 +27,7 @@ type MountOptions struct {
 	MaxIdleConns		uint32
 	SabreDavPartialUpdate	bool
 	TLSSkipVerify		bool
+	TraceFile		string
 }
 
 func parseUInt32(v string, base int, name string, loc *uint32) (err error) {
@@ -80,6 +81,15 @@ func applyOption(mo *MountOptions, key, v string) (err error) {
 		mo.SabreDavPartialUpdate = true
 	case "tlsskipverify":
 		mo.TLSSkipVerify = true
+	case "tracefile":
+		// Mount-option equivalent of -F, for the same reason as
+		// configfile= below: /etc/fstab and systemd .mount units can
+		// only pass mount options, never command-line flags. See
+		// traceOpts() in trace.go for what it does without -T.
+		if v == "" {
+			err = errors.New("tracefile: needs a file name")
+		}
+		mo.TraceFile = v
 	case "configfile":
 		// Applied immediately, in place, as if the config file's lines
 		// had been spliced into the option list right here. This is

@@ -107,7 +107,7 @@ Using it is simple as:
 | -f | don't actually mount |
 | -D | daemonize | default when called as mount.* |
 | -T opts | trace options: fuse,webdav,httpreq,httphdr |
-| -F file | trace file. file will be reopened when renamed, tracing will stop when file is removed |
+| -F file | trace file. file will be reopened when renamed, tracing will stop when file is removed. Without -T nothing is traced, but the file still receives a startup line, the unconditional warnings and everything written to stderr, such as the stack trace of a panic (see `tracefile=` below) |
 | -o opts | mount options |
 | -C file | config file: same option syntax as -o, one option per line, `#` for comments. Options given via -o override the same option from the config file. Mainly meant for credentials, so they don't need to be on the command line or in fstab. Not reachable from /etc/fstab or systemd .mount units - use the `configfile=` mount option below for that. The file's permissions must not be group/world readable (webdavfs refuses to load it otherwise), same posture as an SSH private key. |
 
@@ -144,6 +144,17 @@ Using it is simple as:
 |                        | ones loaded via `configfile=`/-C, are exposed to that same MITM;
 |                        | using both together protects credentials from local exposure only,
 |                        | not from the network)
+| tracefile=file         | Same as -F, but reachable from /etc/fstab and systemd .mount units.
+|                        | Without -T nothing is traced; the file (mode 0600) gets a line when the
+|                        | daemon starts, its unconditional warnings, and anything it writes to
+|                        | stderr, so a crash leaves its stack trace there instead of in /dev/null.
+|                        | The file stays small: apart from -T output, only warnings that should
+|                        | never happen are written. A file that can't be opened is reported
+|                        | when mounting and does not stop the mount.
+|                        | webdavfs does not rotate the file. Rotate it in place (logrotate's
+|                        | `copytruncate`): the daemon keeps writing at the new end. Renaming
+|                        | the file leaves stderr, and so a crash trace, in the renamed file;
+|                        | deleting it loses the crash trace and stops the logging.
 | configfile=file        | Load more options (same syntax as -C, see above) from file, applied
 |                        | in place at this point in the option list. Unlike -C, this **is**
 |                        | reachable from /etc/fstab and systemd .mount units, since those only
