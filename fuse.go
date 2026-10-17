@@ -14,11 +14,14 @@ import (
 	"bazil.org/fuse/fs"
 )
 
-const (
-	dirCacheTime   = 10 * time.Second
-	statCacheTime  = 1 * time.Second
-	attrValidTime  = 1 * time.Minute
-	entryValidTime = 1 * time.Minute
+// Cache lifetimes. Variables, not constants, so the statcache= and
+// attrtimeout= mount options can change them once at startup.
+var (
+	// statCacheTime: how long a PROPFIND result is reused before the
+	// server is asked again.
+	statCacheTime = 1 * time.Second
+	// attrValidTime: how long the kernel may keep file attributes.
+	attrValidTime = 1 * time.Minute
 )
 
 type WebdavFS struct {

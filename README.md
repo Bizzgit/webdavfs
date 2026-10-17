@@ -134,7 +134,29 @@ Using it is simple as:
 | nonempty		| As per fuse documentation |
 | maxconns              | Maximum number of parallel connections to the webdav
 |                       | server (default 8)
-| maxidleconns          | Maximum number of idle connections (default 8)
+| maxidleconns          | Maximum number of idle connections (default 8). With more
+|                       | parallel readers than this, connections are closed and
+|                       | reopened all the time; set it equal to maxconns for
+|                       | many parallel readers.
+| retries               | How many extra attempts a read-only request (GET, PROPFIND,
+|                       | OPTIONS, HEAD) gets when the connection is dropped under
+|                       | it (EOF, reset, broken pipe), also halfway through a
+|                       | read. Default 3, 0 turns retrying off. Writes are never
+|                       | repeated, since a write that failed may have been applied.
+| retrydelay            | Wait before the first retry, doubled for each next one
+|                       | (default 100ms). A duration such as 250ms or 2s; a bare
+|                       | number is seconds.
+| idletimeout           | How long an idle connection is kept open for reuse
+|                       | (default 90s). Same format as retrydelay.
+| timeout               | Maximum time for one request including its body
+|                       | (default 60s). Same format as retrydelay.
+| statcache             | How long a directory listing or file lookup is reused
+|                       | before the server is asked again (default 1s). 0 asks
+|                       | every time.
+| attrtimeout           | How long the kernel keeps file attributes such as size
+|                       | and modification time (default 1m). Raise it for a
+|                       | read-only mount of files that rarely change, to save
+|                       | requests.
 | sabredav_partialupdate | Use the sabredav partialupdate protocol even when
 |                        | the remote server doesn't advertise support (DANGEROUS)
 | tlsskipverify          | Don't verify the remote server's TLS certificate. Needed

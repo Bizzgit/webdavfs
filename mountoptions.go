@@ -5,7 +5,22 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// optDuration is a duration option that remembers whether it was given, so
+// that an explicit 0 (for example statcache=0, "never cache") can be told
+// apart from "not set, use the default".
+type optDuration struct {
+	D	time.Duration
+	Set	bool
+}
+
+// optUInt is the same idea for a count: retries=0 turns retrying off.
+type optUInt struct {
+	N	uint32
+	Set	bool
+}
 
 type MountOptions struct {
 	AllowRoot		bool
@@ -28,6 +43,30 @@ type MountOptions struct {
 	SabreDavPartialUpdate	bool
 	TLSSkipVerify		bool
 	TraceFile		string
+	Retries			optUInt
+	RetryDelay		optDuration
+	IdleTimeout		optDuration
+	Timeout			optDuration
+	StatCache		optDuration
+	AttrTimeout		optDuration
+}
+
+// parseDuration reads a Go duration ("500ms", "30s", "5m"). A bare number
+// is taken as seconds, which is what people expect in an fstab line.
+func parseDuration(v string, name string, loc *optDuration) (err error) {
+	if n, perr := strconv.ParseUint(v, 10, 32); perr == nil {
+		*loc = optDuration{D: time.Duration(n) * time.Second, Set: true}
+		return
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return errors.New(name + ": not a duration (use e.g. 500ms, 30s, 5m or plain seconds)")
+	}
+	if d < 0 {
+		return errors.New(name + ": must not be negative")
+	}
+	*loc = optDuration{D: d, Set: true}
+	return
 }
 
 func parseUInt32(v string, base int, name string, loc *uint32) (err error) {
@@ -77,6 +116,19 @@ func applyOption(mo *MountOptions, key, v string) (err error) {
 		err = parseUInt32(v, 10, "maxconns", &mo.MaxConns)
 	case "maxidleconns":
 		err = parseUInt32(v, 10, "maxidleconns", &mo.MaxIdleConns)
+	case "retries":
+		err = parseUInt32(v, 10, "retries", &mo.Retries.N)
+		mo.Retries.Set = err == nil
+	case "retrydelay":
+		err = parseDuration(v, "retrydelay", &mo.RetryDelay)
+	case "idletimeout":
+		err = parseDuration(v, "idletimeout", &mo.IdleTimeout)
+	case "timeout":
+		err = parseDuration(v, "timeout", &mo.Timeout)
+	case "statcache":
+		err = parseDuration(v, "statcache", &mo.StatCache)
+	case "attrtimeout":
+		err = parseDuration(v, "attrtimeout", &mo.AttrTimeout)
 	case "sabredav_partialupdate":
 		mo.SabreDavPartialUpdate = true
 	case "tlsskipverify":

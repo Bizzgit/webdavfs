@@ -192,6 +192,12 @@ func main() {
 	if mountOpts.MaxIdleConns == 0 {
 		mountOpts.MaxIdleConns = 8
 	}
+	if mountOpts.StatCache.Set {
+		statCacheTime = mountOpts.StatCache.D
+	}
+	if mountOpts.AttrTimeout.Set {
+		attrValidTime = mountOpts.AttrTimeout.D
+	}
 
 	// tracefile= is the mount-option form of -F; -F wins if both are given.
 	// Done before daemonizing so the re-exec'd child gets it as -F too.
@@ -309,6 +315,22 @@ func main() {
 		PutDisabled: mountOpts.ReadWriteDirOps,
 		IsSabre: mountOpts.SabreDavPartialUpdate,
 		TLSSkipVerify: mountOpts.TLSSkipVerify,
+		Retries: defaultRetries,
+		RetryDelay: defaultRetryDelay,
+		IdleTimeout: defaultIdleTimeout,
+		Timeout: defaultTimeout,
+	}
+	if mountOpts.Retries.Set {
+		dav.Retries = int(mountOpts.Retries.N)
+	}
+	if mountOpts.RetryDelay.Set {
+		dav.RetryDelay = mountOpts.RetryDelay.D
+	}
+	if mountOpts.IdleTimeout.Set {
+		dav.IdleTimeout = mountOpts.IdleTimeout.D
+	}
+	if mountOpts.Timeout.Set {
+		dav.Timeout = mountOpts.Timeout.D
 	}
 	err = dav.Mount()
 	if err != nil {

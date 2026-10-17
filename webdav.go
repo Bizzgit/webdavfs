@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -36,6 +37,12 @@ type DavClient struct {
 	MaxConns	int
 	MaxIdleConns	int
 	TLSSkipVerify	bool
+	// Retries is how many extra attempts a read-only request gets after
+	// the connection was dropped under it; 0 turns retrying off.
+	Retries		int
+	RetryDelay	time.Duration
+	IdleTimeout	time.Duration
+	Timeout		time.Duration
 	base		string
 	cc		*http.Client
 	davSem		davSem
@@ -121,6 +128,66 @@ func davToErrno(err *DavError) (*DavError) {
 	}
 	err.Errnum = syscall.EIO
 	return err
+}
+
+// Defaults for the retry and timeout mount options.
+const (
+	defaultRetries     = 3
+	defaultRetryDelay  = 100 * time.Millisecond
+	defaultIdleTimeout = 90 * time.Second
+	defaultTimeout     = 60 * time.Second
+)
+
+// retryableMethod: only requests that can safely be sent twice. A write
+// that died halfway may or may not have been applied, so those are never
+// repeated here.
+func retryableMethod(method string) bool {
+	switch method {
+	case "GET", "HEAD", "PROPFIND", "OPTIONS":
+		return true
+	}
+	return false
+}
+
+// connectionDropped reports whether err means the server (or something on
+// the path) closed the connection without a proper answer: an EOF before
+// the response, a reset, or a broken pipe. These happen when an idle
+// connection is reused just as the server drops it, or when the server
+// refuses a new connection under load, and a second try normally works.
+// Timeouts and cancelled contexts are not retried.
+func connectionDropped(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	// net/http has no exported value for these.
+	msg := err.Error()
+	return strings.Contains(msg, "server closed idle connection") ||
+		strings.Contains(msg, "connection reset by peer")
+}
+
+// retryWait sleeps before retry number attempt (1 for the first retry),
+// doubling the delay each time. It returns false if ctx ended first.
+func (d *DavClient) retryWait(ctx context.Context, attempt int) bool {
+	delay := d.RetryDelay << uint(attempt-1)
+	if delay <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func statusIsValid(resp *http.Response) bool {
@@ -335,6 +402,25 @@ func (d *DavClient) do(req *http.Request) (resp *http.Response, err error) {
 	}
 
 	resp, err = d.cc.Do(req)
+	for attempt := 1; err != nil && attempt <= d.Retries &&
+		retryableMethod(req.Method) && connectionDropped(err) &&
+		req.Context().Err() == nil; attempt++ {
+		if trace(T_HTTP_REQUEST) {
+			tPrintf("%s %s: %v, retry %d of %d", req.Method, req.URL.String(), err, attempt, d.Retries)
+		}
+		if !d.retryWait(req.Context(), attempt) {
+			break
+		}
+		if req.GetBody != nil {
+			// A request body is consumed by the failed attempt.
+			var body io.ReadCloser
+			if body, err = req.GetBody(); err != nil {
+				return
+			}
+			req.Body = body
+		}
+		resp, err = d.cc.Do(req)
+	}
 	if err != nil {
 		// Always report this (not gated by -T) for methods that can
 		// have side effects: if the request body had already been
@@ -381,6 +467,7 @@ func (d *DavClient) Mount() (err error) {
 		// Override some values from DefaultTransport.
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.MaxIdleConnsPerHost = d.MaxIdleConns
+		tr.IdleConnTimeout = d.IdleTimeout
 		tr.DisableCompression = true
 		if d.MaxConns > 0 {
 			// The semaphore below caps concurrent DAV requests, but the
@@ -394,7 +481,7 @@ func (d *DavClient) Mount() (err error) {
 		}
 
 		d.cc = &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: d.Timeout,
 			Transport: tr,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return errors.New("400 Will not follow redirect")
@@ -697,13 +784,33 @@ func (d *DavClient) GetRange(ctx context.Context, path string, offset int64, len
 			tPrintf("GetRange: returns %d bytes", len(data))
 		}()
 	}
+	partial := offset >= 0 && length >= 0
+	for attempt := 0; ; attempt++ {
+		var retry bool
+		data, retry, err = d.getRangeOnce(ctx, path, offset, length, partial)
+		// do() already retries a connection that drops before the
+		// response. This covers one that drops while the body is
+		// being read.
+		if !retry || attempt >= d.Retries || ctx.Err() != nil {
+			return
+		}
+		if trace(T_WEBDAV) {
+			tPrintf("GetRange(%s, %d, %d): %v, retry %d of %d", path, offset, length, err, attempt+1, d.Retries)
+		}
+		if !d.retryWait(ctx, attempt+1) {
+			return
+		}
+	}
+}
+
+// getRangeOnce makes one GET. retry is true if the failure was a connection
+// dropped halfway through the body, which is safe to simply try again.
+func (d *DavClient) getRangeOnce(ctx context.Context, path string, offset int64, length int, partial bool) (data []byte, retry bool, err error) {
 	req, err := d.buildRequest(ctx, "GET", path)
 	if err != nil {
 		return
 	}
-	partial := false
-	if (offset >= 0 && length >= 0 ) {
-		partial = true
+	if partial {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset + int64(length) - 1))
 	}
 	resp, err := d.do(req)
@@ -724,7 +831,8 @@ func (d *DavClient) GetRange(ctx context.Context, path string, offset int64, len
 		return
 	}
 	data, err = ioutil.ReadAll(resp.Body)
-	if len(data) > length {
+	retry = connectionDropped(err)
+	if partial && len(data) > length {
 		data = data[:length]
 	}
 	return
