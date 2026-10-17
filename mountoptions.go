@@ -3,6 +3,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +50,30 @@ type MountOptions struct {
 	Timeout			optDuration
 	StatCache		optDuration
 	AttrTimeout		optDuration
+	ReadAhead		optUInt
+	ReadAheadBlocks		optUInt
+	ReadAheadMax		optUInt
+	HTTP2			bool
+}
+
+// parseSize reads a size in bytes with an optional K, M or G suffix ("512K",
+// "4M"). 0 is allowed and means off. max is the largest value accepted.
+func parseSize(v string, name string, loc *optUInt, max uint64) (err error) {
+	mult := uint64(1)
+	switch {
+	case strings.HasSuffix(v, "K") || strings.HasSuffix(v, "k"):
+		mult, v = 1 << 10, v[:len(v)-1]
+	case strings.HasSuffix(v, "M") || strings.HasSuffix(v, "m"):
+		mult, v = 1 << 20, v[:len(v)-1]
+	case strings.HasSuffix(v, "G") || strings.HasSuffix(v, "g"):
+		mult, v = 1 << 30, v[:len(v)-1]
+	}
+	n, perr := strconv.ParseUint(v, 10, 32)
+	if perr != nil || n*mult > max {
+		return fmt.Errorf("%s: not a size up to %d bytes (use e.g. 1M, 512K or plain bytes)", name, max)
+	}
+	*loc = optUInt{N: uint32(n * mult), Set: true}
+	return
 }
 
 // parseDuration reads a Go duration ("500ms", "30s", "5m"). A bare number
@@ -116,15 +141,39 @@ func applyOption(mo *MountOptions, key, v string) (err error) {
 		err = parseUInt32(v, 10, "maxconns", &mo.MaxConns)
 	case "maxidleconns":
 		err = parseUInt32(v, 10, "maxidleconns", &mo.MaxIdleConns)
+	case "readahead":
+		err = parseSize(v, "readahead", &mo.ReadAhead, 64 << 20)
+	case "readaheadblocks":
+		err = parseUInt32(v, 10, "readaheadblocks", &mo.ReadAheadBlocks.N)
+		if err == nil && mo.ReadAheadBlocks.N > 16 {
+			err = errors.New("readaheadblocks: at most 16")
+		}
+		mo.ReadAheadBlocks.Set = err == nil
+	case "readaheadmax":
+		// Total memory for read buffers over all open files.
+		err = parseSize(v, "readaheadmax", &mo.ReadAheadMax, 4 << 30 - 1)
+	case "http2":
+		mo.HTTP2 = true
 	case "retries":
 		err = parseUInt32(v, 10, "retries", &mo.Retries.N)
+		if err == nil && mo.Retries.N > maxRetries {
+			err = fmt.Errorf("retries: at most %d", maxRetries)
+		}
 		mo.Retries.Set = err == nil
 	case "retrydelay":
 		err = parseDuration(v, "retrydelay", &mo.RetryDelay)
+		if err == nil && mo.RetryDelay.D > maxRetryDelay {
+			err = fmt.Errorf("retrydelay: at most %v", maxRetryDelay)
+		}
 	case "idletimeout":
 		err = parseDuration(v, "idletimeout", &mo.IdleTimeout)
 	case "timeout":
 		err = parseDuration(v, "timeout", &mo.Timeout)
+		if err == nil && mo.Timeout.D < time.Second {
+			// 0 would mean no time limit at all: a stalled server
+			// would hold a connection and a reader for ever.
+			err = errors.New("timeout: at least 1s")
+		}
 	case "statcache":
 		err = parseDuration(v, "statcache", &mo.StatCache)
 	case "attrtimeout":

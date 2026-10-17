@@ -6,12 +6,17 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	"github.com/pborman/getopt/v2"
 )
 
 const VERSION = "1.0"
+
+// buildInfo is set at build time (-ldflags "-X main.buildInfo=..."), so the
+// log line and User-Agent show which build is mounted.
+var buildInfo = ""
 
 type Opts struct {
 	Type		string
@@ -159,7 +164,7 @@ func main() {
 		usage(nil, 0)
 	}
 	if version {
-		fmt.Printf("webdavfs %s\n", VERSION);
+		fmt.Printf("webdavfs %s%s\n", VERSION, buildInfo);
 		os.Exit(0)
 	}
 
@@ -195,6 +200,15 @@ func main() {
 	if mountOpts.StatCache.Set {
 		statCacheTime = mountOpts.StatCache.D
 	}
+	if mountOpts.ReadAhead.Set {
+		readAheadSize = int64(mountOpts.ReadAhead.N)
+	}
+	if mountOpts.ReadAheadMax.Set {
+		readAheadMax = int64(mountOpts.ReadAheadMax.N)
+	}
+	if mountOpts.ReadAheadBlocks.Set {
+		readAheadBlocks = int(mountOpts.ReadAheadBlocks.N)
+	}
 	if mountOpts.AttrTimeout.Set {
 		attrValidTime = mountOpts.AttrTimeout.D
 	}
@@ -220,7 +234,8 @@ func main() {
 	// logging works, and dates the daemon. Without one the logger writes
 	// to stdout, which is still the mount(8) pipe at this point.
 	if traceFile != nil {
-		tPrintf("webdavfs %s started (pid %d) for %s on %s", VERSION, os.Getpid(), url, mountpoint)
+		tPrintf("webdavfs %s%s started (pid %d) for %s on %s", VERSION, buildInfo, os.Getpid(), url, mountpoint)
+		go statsLoop(time.Minute, make(chan struct{}), func(l string) { tPrintf("%s", l) })
 	}
 
 	config := WebdavFS{}
@@ -315,6 +330,7 @@ func main() {
 		PutDisabled: mountOpts.ReadWriteDirOps,
 		IsSabre: mountOpts.SabreDavPartialUpdate,
 		TLSSkipVerify: mountOpts.TLSSkipVerify,
+		HTTP2: mountOpts.HTTP2,
 		Retries: defaultRetries,
 		RetryDelay: defaultRetryDelay,
 		IdleTimeout: defaultIdleTimeout,

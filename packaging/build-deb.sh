@@ -28,7 +28,7 @@ trap 'rm -rf "$stage"' EXIT
 chmod 0755 "$stage"
 
 install -d "$stage/usr/sbin" "$stage/etc/logrotate.d" "$stage/usr/share/doc/webdavfs" "$stage/DEBIAN"
-go build -trimpath -o "$stage/usr/sbin/mount.webdavfs" .
+go build -trimpath -ldflags "-X main.buildInfo=+$(echo "$VERSION" | sed 's/^[^+]*+//')" -o "$stage/usr/sbin/mount.webdavfs" .
 chmod 0755 "$stage/usr/sbin/mount.webdavfs"
 install -m 0644 packaging/logrotate "$stage/etc/logrotate.d/webdavfs"
 install -m 0644 LICENSE.md "$stage/usr/share/doc/webdavfs/copyright"

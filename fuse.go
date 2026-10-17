@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"strconv"
 	"time"
@@ -599,6 +600,8 @@ func (nd *Node) Forget() {
 }
 
 func (nd *Node) ftruncate(ctx context.Context, size uint64, id fuse.RequestID) (err error) {
+	defer atomic.AddUint64(&nd.gen, 1)
+	atomic.AddUint64(&nd.gen, 1)
 	if err = nd.incMetaRefThenLock(ctx, id); err != nil {
 		nd.Unlock()
 		return
@@ -732,7 +735,33 @@ func (nf *Node) Fsync(ctx context.Context, req *fuse.FsyncRequest) (err error) {
 	return nil
 }
 
+// Read is used for handles that are not plain file handles (a file that was
+// just created); it reads without the read buffer. Opened files get a
+// fileHandle, see Open.
 func (nf *Node) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) (err error) {
+	return nf.read(ctx, req, resp, nil)
+}
+
+// fileHandle is an open file. The read buffer lives here and not on the
+// Node: the stream position and the buffered blocks belong to one reader,
+// and two readers of one file (a player and a scanner) must not disturb
+// each other or each other's close.
+type fileHandle struct {
+	*Node
+	ra *raState
+}
+
+func (h *fileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+	return h.Node.read(ctx, req, resp, h.ra)
+}
+
+// Release is called when this handle is closed.
+func (h *fileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
+	h.ra.close()
+	return nil
+}
+
+func (nf *Node) read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse, ra *raState) (err error) {
 	if trace(T_FUSE) {
 		tPrintf("%d Read(%s, %d, %d)", req.Header.ID, nf.Name, req.Offset, req.Size)
 		defer func() {
@@ -751,22 +780,49 @@ func (nf *Node) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Read
 		return
 	}
 	defer nf.decIoRef()
-	nf.Lock()
-	toRead := int64(nf.Size) - req.Offset
-	nf.Unlock()
-	if toRead <= 0 {
-		resp.Data = []byte{}
-		return
+	if ra != nil {
+		statReads.Add(1)
+		defer func() {
+			if err != nil {
+				statReadErrors.Add(1)
+			}
+		}()
 	}
-	if toRead > int64(req.Size) {
-		toRead = int64(req.Size)
+	for attempt := 0; ; attempt++ {
+		nf.Lock()
+		ver := raVer{size: nf.Size, mtime: nf.Mtime, etag: nf.ETag, gen: atomic.LoadUint64(&nf.gen)}
+		path := nf.getPath()
+		nf.Unlock()
+		toRead := int64(ver.size) - req.Offset
+		if toRead <= 0 {
+			resp.Data = []byte{}
+			return
+		}
+		if toRead > int64(req.Size) {
+			toRead = int64(req.Size)
+		}
+		var data []byte
+		if ra != nil {
+			data, err = nf.readAhead(ctx, ra, path, req.Offset, int(toRead), ver)
+		} else {
+			data, err = nf.rangeIf(ctx, path, req.Offset, int(toRead), ver.etag)
+		}
+		if err == nil {
+			resp.Data = data
+			return
+		}
+		// Renamed while we were reading: the old path is gone, the node
+		// is not. Once more with the new path. Removed: say so.
+		nf.Lock()
+		deleted, moved := nf.Deleted, nf.getPath() != path
+		nf.Unlock()
+		if deleted {
+			return fuse.Errno(syscall.ESTALE)
+		}
+		if !moved || attempt > 0 {
+			return
+		}
 	}
-	path := nf.getPath()
-	data, err := dav.GetRange(ctx, path, req.Offset, int(toRead))
-	if err == nil {
-		resp.Data = data
-	}
-	return
 }
 
 func (nf *Node) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) (err error) {
@@ -791,8 +847,10 @@ func (nf *Node) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wr
 	if err = nf.incIoRef(ctx, req.Header.ID); err != nil {
 		return
 	}
+	atomic.AddUint64(&nf.gen, 1)
 	path := nf.getPath()
 	_, err = dav.PutRange(ctx, path, req.Data, req.Offset, false, false)
+	atomic.AddUint64(&nf.gen, 1)
 	if err == nil {
 		resp.Size = len(req.Data)
 		sz := uint64(req.Offset) + uint64(len(req.Data))
@@ -835,9 +893,12 @@ func (nf *Node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.Open
 	dnode, err := dav.Stat(ctx, path)
 	if err == nil {
 		nf.Lock()
+		// Compare before taking over the new values; the other way round
+		// the answer was always "unchanged".
+		unchanged := dnode.Size == nf.Size && dnode.Mtime.Equal(nf.Mtime) && dnode.ETag == nf.ETag
 		nf.Dnode = dnode
 		nf.statInfoTouch()
-		if dnode.Size == nf.Size && dnode.Mtime == nf.Mtime {
+		if unchanged {
 			resp.Flags = fuse.OpenKeepCache
 		}
 		nf.Unlock()
@@ -854,7 +915,7 @@ func (nf *Node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.Open
 
 	nf.decIoRef()
 	if err == nil {
-		handle = nf
+		handle = &fileHandle{Node: nf, ra: newRaState()}
 	}
 	return
 }

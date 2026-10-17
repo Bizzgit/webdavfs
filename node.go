@@ -31,6 +31,10 @@ type Node struct {
 	Parent		*Node
 	Child		map[string]*Node
 	InUse		bool
+	// gen counts changes made through this mount (write, truncate) and
+	// refused reads (file changed on the server). Read buffers are only
+	// valid for the gen they were fetched at.
+	gen		uint64
 }
 
 var rootNode = &Node{

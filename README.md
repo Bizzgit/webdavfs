@@ -147,9 +147,12 @@ Using it is simple as:
 |                       | (default 100ms). A duration such as 250ms or 2s; a bare
 |                       | number is seconds.
 | idletimeout           | How long an idle connection is kept open for reuse
-|                       | (default 90s). Same format as retrydelay.
+|                       | (default 45s). Same format as retrydelay.
 | timeout               | Maximum time for one request including its body
-|                       | (default 60s). Same format as retrydelay.
+|                       | (default 60s, at least 1s). Same format as retrydelay.
+| http2                 | Allow HTTP/2 if the server offers it (default: HTTP/1.1 only).
+|                       | With HTTP/2 maxconns and maxidleconns no longer count TCP
+|                       | connections, since requests share connections.
 | statcache             | How long a directory listing or file lookup is reused
 |                       | before the server is asked again (default 1s). 0 asks
 |                       | every time.
@@ -157,6 +160,17 @@ Using it is simple as:
 |                       | and modification time (default 1m). Raise it for a
 |                       | read-only mount of files that rarely change, to save
 |                       | requests.
+| readahead             | Size of the block that is fetched in one request when
+|                       | reads follow each other (default 1M, 0 turns the read
+|                       | buffer off, at most 64M). The kernel asks for at most
+|                       | 128 KB at a time and every request costs a round trip
+|                       | to the server, so a larger block makes sequential reads
+|                       | much faster. A read that does not continue the previous
+|                       | one (a seek, strided or backward access) is read as
+|                       | asked. K, M and G suffixes are accepted.
+| readaheadblocks       | Blocks kept per open file (default 4, at most 16).
+| readaheadmax          | Memory for read buffers over all open files together
+|                       | (default 128M). Beyond this, reads are not buffered.
 | sabredav_partialupdate | Use the sabredav partialupdate protocol even when
 |                        | the remote server doesn't advertise support (DANGEROUS)
 | tlsskipverify          | Don't verify the remote server's TLS certificate. Needed
@@ -177,6 +191,11 @@ Using it is simple as:
 |                        | `copytruncate`): the daemon keeps writing at the new end. Renaming
 |                        | the file leaves stderr, and so a crash trace, in the renamed file;
 |                        | deleting it loses the crash trace and stops the logging.
+|                        | With a trace file the daemon also writes one `stats:` line
+|                        | per minute, only when something changed: reads, reads answered
+|                        | from the read buffer, GET requests, megabytes received, background
+|                        | fetches, retries, reads that ran out of retries, files that changed
+|                        | on the server while being read (stale), errors and megabytes buffered.
 | configfile=file        | Load more options (same syntax as -C, see above) from file, applied
 |                        | in place at this point in the option list. Unlike -C, this **is**
 |                        | reachable from /etc/fstab and systemd .mount units, since those only

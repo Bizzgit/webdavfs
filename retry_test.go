@@ -41,6 +41,7 @@ func newFlakyServer(t *testing.T, drops int32, handler http.HandlerFunc) *flakyS
 }
 
 func okHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Range", "bytes 0-9/10")
 	w.Header().Set("Content-Length", "10")
 	w.WriteHeader(206)
 	io.WriteString(w, "0123456789")
@@ -106,6 +107,7 @@ func TestGetRangeRetriesTruncatedBody(t *testing.T) {
 	var calls int32
 	srv := newFlakyServer(t, 0, func(w http.ResponseWriter, r *http.Request) {
 		if atomic.AddInt32(&calls, 1) == 1 {
+			w.Header().Set("Content-Range", "bytes 0-9/10")
 			w.Header().Set("Content-Length", "10")
 			w.WriteHeader(206)
 			io.WriteString(w, "012")

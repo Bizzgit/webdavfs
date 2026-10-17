@@ -99,7 +99,12 @@ func tHeaders(hdrs http.Header, prefix string) string {
 	}
 	sort.Strings(h)
 	for _, m := range h {
-		r = append(r, prefix + m + ": " + strings.Join(hdrs[m], "\n") + "\n")
+		val := strings.Join(hdrs[m], "\n")
+		switch strings.ToLower(m) {
+		case "authorization", "proxy-authorization", "cookie", "set-cookie":
+			val = "<redacted>"
+		}
+		r = append(r, prefix + m + ": " + val + "\n")
 	}
 	return strings.Join(r, "")
 }

@@ -37,6 +37,9 @@ type DavClient struct {
 	MaxConns	int
 	MaxIdleConns	int
 	TLSSkipVerify	bool
+	// HTTP2 lets the transport use HTTP/2 when the server offers it. Off by
+	// default: with h2, maxconns no longer counts TCP connections.
+	HTTP2		bool
 	// Retries is how many extra attempts a read-only request gets after
 	// the connection was dropped under it; 0 turns retrying off.
 	Retries		int
@@ -63,6 +66,10 @@ type Dnode struct {
 	Mtime		time.Time
 	Ctime		time.Time
 	Size		uint64
+	// ETag is the strong entity tag as the server sent it (with its
+	// quotes), or "" if there is none or it is weak. Ranges of one file
+	// are only combined when the tag is the same: see GetRangeIf.
+	ETag		string
 }
 
 type Props struct {
@@ -111,6 +118,7 @@ var davToErrnoMap = map[int]syscall.Errno{
 	405:	syscall.EACCES,
 	408:	syscall.ETIMEDOUT,
 	409:	syscall.ENOENT,
+	412:	syscall.ESTALE,
 	416:	syscall.ERANGE,
 	504:	syscall.ETIMEDOUT,
 }
@@ -118,7 +126,7 @@ var davToErrnoMap = map[int]syscall.Errno{
 var userAgent string
 
 func init() {
-	userAgent = fmt.Sprintf("fuse-webdavfs/0.1 (Go) %s (%s)", runtime.GOOS, runtime.GOARCH)
+	userAgent = fmt.Sprintf("fuse-webdavfs/%s%s (Go) %s (%s)", VERSION, buildInfo, runtime.GOOS, runtime.GOARCH)
 }
 
 func davToErrno(err *DavError) (*DavError) {
@@ -134,9 +142,28 @@ func davToErrno(err *DavError) (*DavError) {
 const (
 	defaultRetries     = 3
 	defaultRetryDelay  = 100 * time.Millisecond
-	defaultIdleTimeout = 90 * time.Second
+	defaultIdleTimeout = 45 * time.Second
 	defaultTimeout     = 60 * time.Second
+
+	// Hard limits. maxRetries and maxRetryDelay also bound the mount
+	// options; the body limits protect against a server that sends far
+	// more than was asked for.
+	maxRetries      = 10
+	maxRetryDelay   = 30 * time.Second
+	maxPropFindBody = 64 << 20
+	maxGetBody      = 64 << 20
+	dialTimeout     = 10 * time.Second
+	errorBodyDrain  = 4096
 )
+
+// strongETag returns the entity tag if it can be used with If-Match.
+func strongETag(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
+		return ""
+	}
+	return s
+}
 
 // retryableMethod: only requests that can safely be sent twice. A write
 // that died halfway may or may not have been applied, so those are never
@@ -153,7 +180,8 @@ func retryableMethod(method string) bool {
 // the path) closed the connection without a proper answer: an EOF before
 // the response, a reset, or a broken pipe. These happen when an idle
 // connection is reused just as the server drops it, or when the server
-// refuses a new connection under load, and a second try normally works.
+// drops a new connection under load, and a second try normally works.
+// A refused connection (nothing listening) is not retried.
 // Timeouts and cancelled contexts are not retried.
 func connectionDropped(err error) bool {
 	if err == nil {
@@ -170,13 +198,21 @@ func connectionDropped(err error) bool {
 	// net/http has no exported value for these.
 	msg := err.Error()
 	return strings.Contains(msg, "server closed idle connection") ||
+		strings.Contains(msg, "GOAWAY") ||
 		strings.Contains(msg, "connection reset by peer")
 }
 
 // retryWait sleeps before retry number attempt (1 for the first retry),
-// doubling the delay each time. It returns false if ctx ended first.
+// doubling the delay each time up to maxRetryDelay. It returns false if ctx
+// ended first.
 func (d *DavClient) retryWait(ctx context.Context, attempt int) bool {
-	delay := d.RetryDelay << uint(attempt-1)
+	delay := d.RetryDelay
+	for i := 1; i < attempt && delay < maxRetryDelay; i++ {
+		delay *= 2
+	}
+	if delay > maxRetryDelay {
+		delay = maxRetryDelay
+	}
 	if delay <= 0 {
 		return ctx.Err() == nil
 	}
@@ -287,11 +323,9 @@ func drainBody(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return
 	}
-	b := make([]byte, 256)
-	var err error
-	for err != io.EOF {
-		_, err = resp.Body.Read(b)
-	}
+	// Any error ends the loop: a truncated body gives ErrUnexpectedEOF
+	// every time, never io.EOF.
+	io.Copy(io.Discard, io.LimitReader(resp.Body, maxGetBody))
 	resp.Body.Close()
 	resp.Body = nil
 }
@@ -381,7 +415,16 @@ func (d *DavClient) request(ctx context.Context, method string, path string, b .
 	return d.do(req)
 }
 
-func (d *DavClient) do(req *http.Request) (resp *http.Response, err error) {
+// do sends req, retrying a read-only request whose connection was dropped.
+func (d *DavClient) do(req *http.Request) (*http.Response, error) {
+	left := d.Retries
+	return d.doRetry(req, &left)
+}
+
+// doRetry is do with a retry budget that the caller can share with its own
+// retries (GetRange retries a body that broke off), so the two layers
+// never multiply.
+func (d *DavClient) doRetry(req *http.Request, left *int) (resp *http.Response, err error) {
 	req.Header.Set("User-Agent", userAgent)
 
 	if trace(T_HTTP_REQUEST) {
@@ -402,9 +445,12 @@ func (d *DavClient) do(req *http.Request) (resp *http.Response, err error) {
 	}
 
 	resp, err = d.cc.Do(req)
-	for attempt := 1; err != nil && attempt <= d.Retries &&
+	for err != nil && *left > 0 &&
 		retryableMethod(req.Method) && connectionDropped(err) &&
-		req.Context().Err() == nil; attempt++ {
+		req.Context().Err() == nil {
+		attempt := d.Retries - *left + 1
+		*left--
+		statRetries.Add(1)
 		if trace(T_HTTP_REQUEST) {
 			tPrintf("%s %s: %v, retry %d of %d", req.Method, req.URL.String(), err, attempt, d.Retries)
 		}
@@ -420,6 +466,9 @@ func (d *DavClient) do(req *http.Request) (resp *http.Response, err error) {
 			req.Body = body
 		}
 		resp, err = d.cc.Do(req)
+	}
+	if err != nil && *left == 0 && d.Retries > 0 && retryableMethod(req.Method) && connectionDropped(err) {
+		statRetryGaveUp.Add(1)
 	}
 	if err != nil {
 		// Always report this (not gated by -T) for methods that can
@@ -447,8 +496,43 @@ func (d *DavClient) do(req *http.Request) (resp *http.Response, err error) {
 			Code: resp.StatusCode,
 			Location: resp.Header.Get("Location"),
 		})
+		// Callers return on err without touching the body, so release
+		// the connection here: a body that is never closed pins one of
+		// the maxconns connections for good.
+		io.Copy(io.Discard, io.LimitReader(resp.Body, errorBodyDrain))
+		resp.Body.Close()
+		resp.Body = http.NoBody
 	}
 	return
+}
+
+// newTransport builds the HTTP transport from the connection options.
+func (d *DavClient) newTransport() *http.Transport {
+	// Override some values from DefaultTransport.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConnsPerHost = d.MaxIdleConns
+	tr.IdleConnTimeout = d.IdleTimeout
+	tr.DisableCompression = true
+	// The server speaks HTTP/1.1. Behind a proxy that offers h2,
+	// maxconns and maxidleconns would stop meaning TCP connections
+	// and the dropped-connection handling would not apply.
+	if !d.HTTP2 {
+		tr.ForceAttemptHTTP2 = false
+		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}
+	tr.TLSHandshakeTimeout = dialTimeout
+	tr.DialContext = (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext
+	if d.MaxConns > 0 {
+		// The semaphore below caps concurrent DAV requests, but the
+		// transport itself has no hard connection limit by default -
+		// give it one too, so "maxconns" actually bounds the number
+		// of TCP connections, not just in-flight requests.
+		tr.MaxConnsPerHost = d.MaxConns
+	}
+	if d.TLSSkipVerify {
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	return tr
 }
 
 func (d *DavClient) Mount() (err error) {
@@ -464,22 +548,7 @@ func (d *DavClient) Mount() (err error) {
 		if d.MaxConns > 0 {
 			d.davSem = make(davSem, d.MaxConns)
 		}
-		// Override some values from DefaultTransport.
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.MaxIdleConnsPerHost = d.MaxIdleConns
-		tr.IdleConnTimeout = d.IdleTimeout
-		tr.DisableCompression = true
-		if d.MaxConns > 0 {
-			// The semaphore below caps concurrent DAV requests, but the
-			// transport itself has no hard connection limit by default -
-			// give it one too, so "maxconns" actually bounds the number
-			// of TCP connections, not just in-flight requests.
-			tr.MaxConnsPerHost = d.MaxConns
-		}
-		if d.TLSSkipVerify {
-			tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-		}
-
+		tr := d.newTransport()
 		d.cc = &http.Client{
 			Timeout: d.Timeout,
 			Transport: tr,
@@ -596,8 +665,12 @@ func (d *DavClient) PropFind(ctx context.Context, path string, depth int, props 
 		return
 	}
 
-	contents, err := ioutil.ReadAll(resp.Body)
+	contents, err := ioutil.ReadAll(io.LimitReader(resp.Body, maxPropFindBody+1))
 	if err != nil {
+		return
+	}
+	if len(contents) > maxPropFindBody {
+		err = errors.New("PROPFIND answer too large")
 		return
 	}
 
@@ -707,6 +780,7 @@ func (d *DavClient) Readdir(ctx context.Context, path string, detail bool) (ret 
 			Target: p.RefTarget,
 		}
 		if detail {
+			n.ETag = strongETag(p.Etag)
 			n.Mtime = parseTime(p.LastModified)
 			n.Ctime = parseTime(p.CreationDate)
 			if n.IsLink {
@@ -749,7 +823,8 @@ func (d *DavClient) Stat(ctx context.Context, path string) (ret Dnode, err error
 		Mtime: parseTime(p.LastModified),
 		Ctime: parseTime(p.CreationDate),
 		Size: size,
-	} 
+		ETag: strongETag(p.Etag),
+	}
 	return
 }
 
@@ -769,6 +844,14 @@ func (d *DavClient) Get(ctx context.Context, path string) (data []byte, err erro
 }
 
 func (d *DavClient) GetRange(ctx context.Context, path string, offset int64, length int) (data []byte, err error) {
+	return d.GetRangeIf(ctx, path, offset, length, "")
+}
+
+// GetRangeIf is GetRange with a guard: if etag is not empty the request
+// carries If-Match, so a file that was replaced on the server since the tag
+// was read gives 412 (ESTALE) instead of bytes of the new file glued to
+// bytes of the old one.
+func (d *DavClient) GetRangeIf(ctx context.Context, path string, offset int64, length int, etag string) (data []byte, err error) {
 	if err = d.semAcquire(ctx); err != nil {
 		return
 	}
@@ -785,27 +868,51 @@ func (d *DavClient) GetRange(ctx context.Context, path string, offset int64, len
 		}()
 	}
 	partial := offset >= 0 && length >= 0
-	for attempt := 0; ; attempt++ {
+	left := d.Retries
+	for {
 		var retry bool
-		data, retry, err = d.getRangeOnce(ctx, path, offset, length, partial)
-		// do() already retries a connection that drops before the
+		data, retry, err = d.getRangeOnce(ctx, path, offset, length, partial, etag, &left)
+		// doRetry already retries a connection that drops before the
 		// response. This covers one that drops while the body is
-		// being read.
-		if !retry || attempt >= d.Retries || ctx.Err() != nil {
+		// being read, from the same budget.
+		if !retry || left <= 0 || ctx.Err() != nil {
+			if retry {
+				statRetryGaveUp.Add(1)
+			}
 			return
 		}
+		attempt := d.Retries - left + 1
+		left--
+		statRetries.Add(1)
 		if trace(T_WEBDAV) {
-			tPrintf("GetRange(%s, %d, %d): %v, retry %d of %d", path, offset, length, err, attempt+1, d.Retries)
+			tPrintf("GetRange(%s, %d, %d): %v, retry %d of %d", path, offset, length, err, attempt, d.Retries)
 		}
-		if !d.retryWait(ctx, attempt+1) {
+		if !d.retryWait(ctx, attempt) {
 			return
 		}
 	}
 }
 
+// parseContentRange reads "bytes first-last/total"; total is -1 for "*".
+func parseContentRange(h string) (first, last, total int64, ok bool) {
+	var t string
+	if n, _ := fmt.Sscanf(h, "bytes %d-%d/%s", &first, &last, &t); n != 3 {
+		return 0, 0, 0, false
+	}
+	total = -1
+	if t != "*" {
+		v, err := strconv.ParseInt(t, 10, 64)
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		total = v
+	}
+	return first, last, total, first >= 0 && last >= first
+}
+
 // getRangeOnce makes one GET. retry is true if the failure was a connection
-// dropped halfway through the body, which is safe to simply try again.
-func (d *DavClient) getRangeOnce(ctx context.Context, path string, offset int64, length int, partial bool) (data []byte, retry bool, err error) {
+// that broke off halfway through the body, which is safe to try again.
+func (d *DavClient) getRangeOnce(ctx context.Context, path string, offset int64, length int, partial bool, etag string, left *int) (data []byte, retry bool, err error) {
 	req, err := d.buildRequest(ctx, "GET", path)
 	if err != nil {
 		return
@@ -813,28 +920,57 @@ func (d *DavClient) getRangeOnce(ctx context.Context, path string, offset int64,
 	if partial {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset + int64(length) - 1))
 	}
-	resp, err := d.do(req)
+	if etag != "" {
+		req.Header.Set("If-Match", etag)
+	}
+	resp, err := d.doRetry(req, left)
 	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
+	statGets.Add(1)
 
 	if !statusIsValid(resp) {
 		err = errors.New(resp.Status)
 		return
 	}
-	if partial && resp.StatusCode != 206 {
+	if !partial {
+		data, err = ioutil.ReadAll(io.LimitReader(resp.Body, maxGetBody+1))
+		if err == nil && len(data) > maxGetBody {
+			data, err = nil, errors.New("answer too large")
+		}
+		statBytes.Add(int64(len(data)))
+		return
+	}
+	if resp.StatusCode != 206 {
 		err = davToErrno(&DavError{
 			Message: "416 Range Not Satisfiable",
 			Code: 416,
 		})
 		return
 	}
-	data, err = ioutil.ReadAll(resp.Body)
-	retry = connectionDropped(err)
-	if partial && len(data) > length {
-		data = data[:length]
+	// Check that this is the range we asked for, and nothing more: a
+	// server that sends a different range, or a huge body, must not be
+	// believed or buffered.
+	first, last, total, ok := parseContentRange(resp.Header.Get("Content-Range"))
+	if !ok || first != offset || last-first+1 > int64(length) {
+		err = fmt.Errorf("unexpected Content-Range %q for bytes %d-%d", resp.Header.Get("Content-Range"), offset, offset+int64(length)-1)
+		return
 	}
+	want := int(last - first + 1)
+	if want < length && total >= 0 && last+1 < total {
+		// Fewer bytes than asked, and not because the file ended.
+		retry, err = true, io.ErrUnexpectedEOF
+		return
+	}
+	buf := make([]byte, want)
+	n, rerr := io.ReadFull(resp.Body, buf)
+	statBytes.Add(int64(n))
+	if rerr != nil {
+		retry, err = connectionDropped(rerr), rerr
+		return
+	}
+	data = buf
 	return
 }
 
